@@ -9,4 +9,8 @@ url = "https://www.ncei.noaa.gov/data/global-historical-climatology-network-dail
 
 r = requests.get(url, timeout=30)
 
+with open("data/raw/ACW00011604.csv", "w") as f:
+    f.write(r.text)
+
+
 print(r.status_code)
