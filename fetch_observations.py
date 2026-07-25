@@ -5,12 +5,18 @@ import urllib3.util.connection
 # NOAA advertises IPv6 addresses that hang on this network — force IPv4
 urllib3.util.connection.allowed_gai_family = lambda: socket.AF_INET
 
-url = "https://www.ncei.noaa.gov/data/global-historical-climatology-network-daily/access/ACW00011604.csv"
+def download_station(station_id):
+    # build the url using station_id
+    url = f"https://www.ncei.noaa.gov/data/global-historical-climatology-network-daily/access/{station_id}.csv"
 
-r = requests.get(url, timeout=30)
+    response = requests.get(url, timeout=30)
 
-with open("data/raw/ACW00011604.csv", "w") as f:
-    f.write(r.text)
-
-
-print(r.status_code)
+    if response.status_code==200:
+        with open(f"data/raw/{station_id}.csv", "w") as file:
+            file.write(response.text)
+        return True
+    else:
+        print(f"Failed: status {response.status_code}")
+        return False
+    
+download_station("ACW00011604")
