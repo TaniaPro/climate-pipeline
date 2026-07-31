@@ -35,3 +35,7 @@ ghcnd-countries.txt.
 Station IDs are fixed-width; chars 0-1 are the FIPS country code. Filter
 with line[:2] in the country list — checked "starts with", not "contains",
 to avoid matching the code elsewhere in the ID.
+
+## NEXT
+Scope down 1,773 stations to a subset — decide how (cap per country, or
+filter by length of record). Then uncomment the download loop.
