@@ -6,7 +6,8 @@ import urllib3.util.connection
 urllib3.util.connection.allowed_gai_family = lambda: socket.AF_INET
 
 def download_station(station_id):
-    # build the url using station_id
+    # Fetches one station's daily CSV from NOAA and saves it to data/raw/.
+    # Returns True on success, False on any HTTP error.
     url = f"https://www.ncei.noaa.gov/data/global-historical-climatology-network-daily/access/{station_id}.csv"
 
     # response = what the server sent back. Inspect it with dir(response).
@@ -28,10 +29,37 @@ def download_station(station_id):
         print(f"Failed: status {response.status_code}")
         return False
     
+def download_stationids():
+    # Downloads the GHCN-D station inventory (fixed-width text) and returns it as a list of lines.
+    # Each line's columns: 0-1 = FIPS country code, 0-10 = 11-char station ID.
+    url = "https://www.ncei.noaa.gov/data/global-historical-climatology-network-daily/doc/ghcnd-stations.txt"
+    response = requests.get(url, timeout=30)
+
+    if response.status_code == 200:
+        with open("data/raw/ghcnd-stations.txt", "w") as file:
+            file.write(response.text)
+
+        return response.text.splitlines()
+
+    else:
+        print(f"Failed: status {response.status_code}")
+        return None
 
 
+lines = download_stationids()
 
-stations = ["ACW00011604", "AF000040930", "AGE00147704"]
+# FIPS country codes selected for the project: European and Mediterranean
+# countries with strong recent heat anomalies and long station records.
+fips_country_code = ["SP", "PO", "FR", "IT", "GM", "UK", "GR", "IS"]
 
-for station in stations:
-    download_station(station)
+
+station_ids=[]
+
+for line in lines:
+    if  line[:2] in fips_country_code:
+        station_ids.append(line[:11])  # cols 0-10 are the station ID in the fixed-width format
+
+
+# Uncomment to run the actual downloads (slow — one HTTP request per station).
+# for station_id in station_ids:
+#     download_station(station_id)
