@@ -28,4 +28,10 @@ def download_station(station_id):
         print(f"Failed: status {response.status_code}")
         return False
     
-download_station("ACW00011604")
+
+
+
+stations = ["ACW00011604", "AF000040930", "AGE00147704"]
+
+for station in stations:
+    download_station(station)
