@@ -42,11 +42,15 @@ fips_country_code = ["US", "JA", "AS", "CA", "GM", "SP", "FR"]
 firstyear=1990
 lastyear=2025
 
+
 station_ids=[]
 tmax_ok=set()
 prcp_ok=set()
 
+
 for line in lines:
+    # ghcnd-inventory.txt is fixed-width: [0:11] station id, [31:35] element
+    # (TMAX/PRCP/...), [36:40] record first year, [41:45] record last year.
     # Keep only stations with unbroken coverage across the whole target range
     # (record start <= firstyear and record end >= lastyear).
     if (line[:2] in fips_country_code
@@ -59,11 +63,27 @@ for line in lines:
 
 
 tmax_and_prcp = tmax_ok & prcp_ok
-print(len(tmax_and_prcp))
+tmax_and_prcp_cap=[]
+per_country = {}
+
+for station in tmax_and_prcp:
+    country=station[:2]
+    if country not in per_country:
+        per_country[country]=1
+    else:
+        per_country[country]+=1
+    # Cap (limit) per country so no single country dominates the dataset
+    if per_country[country]<=75:
+        tmax_and_prcp_cap.append(station)
+
+
+# Verification
 from collections import Counter
-print(Counter(s[:2] for s in tmax_and_prcp))
+print(len(tmax_and_prcp_cap))
+print(Counter(s[:2] for s in tmax_and_prcp_cap))
 
 
-# Uncomment to run the actual downloads (slow — one HTTP request per station).
-# for station_id in station_ids:
-#     download_station(station_id)
+# Disabled until the station selection above is finalized — uncomment to
+# actually fetch the capped station list.
+#for station_id in tmax_and_prcp_cap:
+#    download_station(station_id)
