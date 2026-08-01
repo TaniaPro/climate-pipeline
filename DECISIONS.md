@@ -40,18 +40,24 @@ to avoid matching the code elsewhere in the ID.
 
 **Went global instead of Europe-only**
 Switched from 8 European/Mediterranean countries to 7 data-rich countries
-across 4 continents (US, Japan, Australia, Canada, Germany, Spain, France).
-Reason: a global warming story is stronger than a regional one, and the
-European-only set had too few long-record stations in small countries
-(Israel 4, Greece 8). Chose countries for both warming signal and data
-availability.
+across 4 continents: US, Japan, Australia, Canada, Germany, Spain, France.
+A global warming story is stronger than a regional one, and the European
+set had too few long-record stations in small countries (Israel 4, Greece 8).
+Chose countries for both warming signal and data availability.
 
 **Require BOTH TMAX and PRCP, not either**
-A station only qualifies if it has long records (1990-2025) for both
-temperature and precipitation. This lets me study temp and rainfall at the
-same place over the same period (e.g. did places that warmed also dry out).
-Stricter, fewer stations, but comparable and richer.
+A station qualifies only if it has long records (1990-2025) for both
+temperature and precipitation. Lets me study temp and rainfall at the same
+place over the same period. Built via two sets (tmax_ok, prcp_ok) and their
+intersection.
 
-**Plan: cap at 75 stations per country**
-US and Australia dominate (5369, 2756); without a cap the dataset isn't
-really global. Cap keeps it balanced. (Cap logic not yet implemented.)
+**Cap at 75 stations per country**
+US and Australia had thousands of qualifying stations (5369, 2756) and would
+dominate an uncapped dataset. Capping at 75 keeps it balanced and global.
+Final result: 491 stations (US/SP/AS/JA/GM at 75, FR 68, CA 48).
+
+**Inventory file lives at a different path than the CSVs**
+Station CSVs: /data/global-historical-climatology-network-daily/access/
+Metadata (inventory, stations): /pub/data/ghcn/daily/
+Wrong path returns an HTML error page with status 200 — so check content,
+not just status code.
