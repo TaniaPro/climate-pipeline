@@ -6,19 +6,7 @@ import urllib3.util.connection
 urllib3.util.connection.allowed_gai_family = lambda: socket.AF_INET
 
 def download_station(station_id):
-    # Fetches one station's daily CSV from NOAA and saves it to data/raw/.
-    # Returns True on success, False on any HTTP error.
     url = f"https://www.ncei.noaa.gov/data/global-historical-climatology-network-daily/access/{station_id}.csv"
-
-    # response = what the server sent back. Inspect it with dir(response).
-    # Useful attributes:
-    #   status_code -> number, 200 means OK
-    #   text        -> body as text (the CSV)
-    #   content     -> body as raw bytes
-    #   headers     -> server info (type, size, date)
-    #   url         -> the address fetched
-    #   ok          -> True if status under 400
-    #   encoding    -> text encoding, e.g. utf-8
     response = requests.get(url, timeout=30)
 
     if response.status_code==200:
@@ -28,15 +16,15 @@ def download_station(station_id):
     else:
         print(f"Failed: status {response.status_code}")
         return False
-    
-def download_stationids():
-    # Downloads the GHCN-D station inventory (fixed-width text) and returns it as a list of lines.
-    # Each line's columns: 0-1 = FIPS country code, 0-10 = 11-char station ID.
-    url = "https://www.ncei.noaa.gov/data/global-historical-climatology-network-daily/doc/ghcnd-stations.txt"
+
+
+def download_station_inventory():
+    # Station ID is chars 0-10; its first 2 chars double as the FIPS country code.
+    url = "https://www.ncei.noaa.gov/pub/data/ghcn/daily/ghcnd-inventory.txt"
     response = requests.get(url, timeout=30)
 
     if response.status_code == 200:
-        with open("data/raw/ghcnd-stations.txt", "w") as file:
+        with open("data/raw/ghcnd-inventory.txt", "w") as file:
             file.write(response.text)
 
         return response.text.splitlines()
@@ -46,18 +34,34 @@ def download_stationids():
         return None
 
 
-lines = download_stationids()
+lines = download_station_inventory()
 
-# FIPS country codes selected for the project: European and Mediterranean
-# countries with strong recent heat anomalies and long station records.
-fips_country_code = ["SP", "PO", "FR", "IT", "GM", "UK", "GR", "IS"]
-
+# FIPS country codes: data-rich countries across 4 continents (North America,
+# Asia, Oceania, Europe), chosen for strong warming signal and long records.
+fips_country_code = ["US", "JA", "AS", "CA", "GM", "SP", "FR"]
+firstyear=1990
+lastyear=2025
 
 station_ids=[]
+tmax_ok=set()
+prcp_ok=set()
 
 for line in lines:
-    if  line[:2] in fips_country_code:
-        station_ids.append(line[:11])  # cols 0-10 are the station ID in the fixed-width format
+    # Keep only stations with unbroken coverage across the whole target range
+    # (record start <= firstyear and record end >= lastyear).
+    if (line[:2] in fips_country_code
+            and int(line[36:40]) <= firstyear
+            and int(line[41:45]) >= lastyear):
+        if line[31:35].strip() == "TMAX":
+            tmax_ok.add(line[:11])
+        elif line[31:35].strip() == "PRCP":
+            prcp_ok.add(line[:11])
+
+
+tmax_and_prcp = tmax_ok & prcp_ok
+print(len(tmax_and_prcp))
+from collections import Counter
+print(Counter(s[:2] for s in tmax_and_prcp))
 
 
 # Uncomment to run the actual downloads (slow — one HTTP request per station).

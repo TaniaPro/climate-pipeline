@@ -36,6 +36,22 @@ Station IDs are fixed-width; chars 0-1 are the FIPS country code. Filter
 with line[:2] in the country list — checked "starts with", not "contains",
 to avoid matching the code elsewhere in the ID.
 
-## NEXT
-Scope down 1,773 stations to a subset — decide how (cap per country, or
-filter by length of record). Then uncomment the download loop.
+## 2026-08-01
+
+**Went global instead of Europe-only**
+Switched from 8 European/Mediterranean countries to 7 data-rich countries
+across 4 continents (US, Japan, Australia, Canada, Germany, Spain, France).
+Reason: a global warming story is stronger than a regional one, and the
+European-only set had too few long-record stations in small countries
+(Israel 4, Greece 8). Chose countries for both warming signal and data
+availability.
+
+**Require BOTH TMAX and PRCP, not either**
+A station only qualifies if it has long records (1990-2025) for both
+temperature and precipitation. This lets me study temp and rainfall at the
+same place over the same period (e.g. did places that warmed also dry out).
+Stricter, fewer stations, but comparable and richer.
+
+**Plan: cap at 75 stations per country**
+US and Australia dominate (5369, 2756); without a cap the dataset isn't
+really global. Cap keeps it balanced. (Cap logic not yet implemented.)
