@@ -201,12 +201,127 @@ row_count, loaded_at) is the backfill-vs-incremental switch — per-station,
 survives crashes, auto-handles brand-new stations. Not a global "first run"
 flag.
 
-## Open / undecided (next session)
+## 2026-08-08
 
-- **Change-detection**: whether to check S3 Last-Modified/ETag (or content
-  hash) to skip unchanged station files, or just always pull the trailing
-  window and let upsert absorb it. Trade: cheap skip vs. simpler always-pull.
-- **Code structure / placement**: where manifest read/write, backfill-vs-
-  incremental decision, and fetching live. Leaning toward splitting the current
-  fetch script into fetcher / db(loader) / orchestration rather than one script
-  doing everything — but needs a look at current repo layout to finalize.
+**Source layout: csv.gz/by_station/, decompressed in-flight**
+Verified against the live bucket (noaa-ghcn-pds), not just docs. The bucket
+exposes data both by_station and by_year, in csv / csv.gz / parquet.
+
+Chose by_station, not by_year: the project loads 491 specific stations' full
+history. by_station lets me fetch exactly those files by ID (csv.gz/by_station/
+{station_id}.csv.gz); by_year would download all ~133k global stations per year
+and discard 99.6%. Year filtering happens at load time in code, so by_station's
+lack of a year filter costs nothing. by_station also matches the per-station
+architecture (per-station manifest, backfill-or-incremental, station_id key).
+
+Chose csv.gz over csv: ~10x smaller over the wire (verified: ACW00011604 is
+41 KB as .csv vs 4 KB as .csv.gz; AE000041196 is 2 MB vs 254 KB). Downloaded
+gz is decompressed in memory and parsed — never written to disk (consistent
+with no-disk-landing).
+
+Path pattern: csv.gz/by_station/{station_id}.csv.gz
+
+Note for change-detection (still open): the whole by_station set is regenerated
+in bulk each refresh cycle (all files show near-identical Last-Modified
+timestamps), so Last-Modified changes on nearly every file every cycle whether
+or not its data changed — a weak "did the data change" signal. A content hash
+would be needed to catch "regenerated but identical." Decide skip-strategy later.
+
+**Dataset documentation reference**
+Authoritative field/format definitions for GHCN-D come from the awslabs
+open-data-docs README (github.com/awslabs/open-data-docs/tree/main/docs/noaa/
+noaa-ghcn): observation row format (ID, DATE, ELEMENT, DATA_VALUE, M/Q/S flags,
+OBS-TIME), full element definitions, source-flag priority order, and the fixed-
+width specs for ghcnd-stations.txt and ghcnd-inventory.txt. Use it as the
+reference for parsing positions and element meanings rather than guessing.
+
+**raw.stations sourced from ghcnd-stations.txt, not the observation files**
+Station metadata (lat/lon/elevation/name/state/WMO) is available two ways: (a)
+repeated on every row of each observation CSV, or (b) as a dedicated one-row-
+per-station file, ghcnd-stations.txt. Chose (b): it's the authoritative source
+that treats station facts as station facts (matches the normalization decision
+to keep them in raw.stations, not duplicated across observation rows), it has
+fields the observation CSVs lack (STATE, GSN/HCN flags, WMO ID), and it's one
+small file to load instead of parsing 491 observation files and de-duping their
+repeated coordinate columns. Fixed-width (not CSV) — parse by column positions,
+same style as ghcnd-inventory.txt:
+  ID 1-11, LATITUDE 13-20, LONGITUDE 22-30, ELEVATION 32-37, STATE 39-40,
+  NAME 42-71, GSN 73-75, HCN/CRN 77-79, WMO 81-85.
+Lives on S3 at noaa-ghcn-pds/ghcnd-stations.txt (consistent with S3 source).
+
+**Considered and rejected: superghcnd_diff for change-detection**
+superghcnd is a separate distribution of the same data as one merged file,
+published daily as superghcnd_full (entire dataset, ~tens of GB) and
+superghcnd_diff (only rows changed since the last run, across all stations).
+The diff file directly states "what changed" — tempting for change-detection.
+Rejected because it doesn't fit this project's scale or architecture:
+  1. It's all-stations — using it means downloading every station on Earth's
+     daily changes and filtering to our 491 (the by_year problem we already
+     rejected).
+  2. It overturns the load model — full+diff is "load the whole blob once, then
+     apply daily deltas," vs. our per-station-file + trailing-window upsert.
+  3. Our incremental strategy already handles revisions: re-pull the 491
+     stations' trailing ~90-day window and upsert catches both new and revised
+     rows, scoped to exactly our stations, no giant-file filtering.
+The diff is built for mirroring the ENTIRE GHCN dataset, where re-pulling
+everything daily is infeasible so a delta is essential. At 491 stations,
+re-pulling a small window is trivial — the delta solves a problem we don't have,
+at the cost of an all-stations download and an architecture rewrite. Same
+scale-fit logic as the other rejections.
+**by_station file format: long/EAV, no header, 8 comma fields**
+Confirmed by fetching a real station (ACW00011604). The by_station CSV is
+already long/EAV — one row per station/date/element — NOT the wide format the
+older access/ CSVs used. So no wide->long pivot is needed in parsing; the source
+arrives in the target shape. No header row. Fields, in order:
+  station_id, date (YYYYMMDD), element, value, m_flag, q_flag, s_flag, obs_time
+Example: ACW00011604,19490101,TMAX,289,,,X,
+
+**Fetch rewritten to S3, IPv4 hack removed, verified working**
+download_station now fetches csv.gz/by_station/{id}.csv.gz from S3, decompresses
+in memory (gzip.decompress on response.content — bytes, not .text), returns text,
+no disk write. The old NOAA HTTP endpoint and the IPv4/allowed_gai_family hack
+are gone — S3 doesn't have the IPv6 hang. Tested against ACW00011604: fetched,
+decompressed, printed readable rows. download_station_inventory likewise moved to
+the S3 URL and no longer writes to disk.
+
+**raw.observations stored fully as text (raw = as-is)**
+Every field from the source file is stored as text, no conversion at the raw
+layer (dates stay YYYYMMDD strings, values stay integer-tenths strings). Raw
+mirrors source; casting/typing happens later in dbt. Columns:
+  station_id, obs_date, element, value, m_flag, q_flag, s_flag, obs_time (from
+  the file), plus source_file (provenance) and loaded_at (timestamptz DEFAULT
+  now()). Table created in the raw schema.
+M/Q/S flags kept as three separate columns (the by_station format supplies them
+separately), reversing the earlier "packed attributes" idea, which was based on
+the wide access/ format.
+
+**Database timezone set to UTC**
+ALTER DATABASE climate SET timezone = 'UTC'. timestamptz already stores UTC
+internally; this makes display UTC too, so stored and shown match. Removes
+session-dependent display confusion for loaded_at.
+
+**No index on raw.observations (yet)**
+Raw is a bulk-load landing table, not queried directly for analysis (dbt reads
+it once and builds indexed marts downstream). Indexes slow bulk loads, so none
+now. A UNIQUE (station_id, obs_date, element) constraint will be added later —
+required for the incremental upsert (ON CONFLICT) — which brings its own index
+for correctness, not query speed.
+
+**Code structure: nothing runs on import**
+fetch_observations.py was a script with loose top-level code that ran (and hung)
+on import. Refactored to only define functions — download_station,
+download_station_inventory, parse_station, select_stations (selection logic
+wrapped, returns the station IDs) — with a __main__ block that runs the selection
+count only when executed directly.
+
+## Open / undecided (next session)
+- Persist the 491 station list. select_stations() recomputes the IDs from the
+  inventory every run; the concrete list isn't saved. Decide: recompute each run
+  vs. compute once and store (likely into raw.stations, which would double as the
+  authoritative project station list). Leaning toward storing.
+- Parser + loader. parse_station splits fetched text into rows; still need the
+  loader that inserts them into raw.observations, plus the load manifest / upsert
+  logic from earlier decisions.
+- Change-detection skip strategy. Always-pull trailing window vs. content hash.
+  Last-Modified already noted as weak (whole by_station set is regenerated in
+  bulk each cycle, so timestamps change even when data doesn't).
