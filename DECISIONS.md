@@ -325,3 +325,25 @@ count only when executed directly.
 - Change-detection skip strategy. Always-pull trailing window vs. content hash.
   Last-Modified already noted as weak (whole by_station set is regenerated in
   bulk each cycle, so timestamps change even when data doesn't).
+
+
+
+## 2026-08-22
+
+Loader: COPY into raw.observations, with source_file provenance load_station bulk-loads a station's parsed text into raw.observations via Postgres COPY (FROM STDIN, FORMAT csv), not row-by-row INSERT — COPY is built for bulk and the source grows over time (daily updates + revisions), so bulk is the right fit. psycopg2 (already installed) is the driver; copy_expert feeds the text through a cursor.
+
+parse_station stamps each line with source_file (the station id) before loading, so COPY fills 9 columns: the 8 from the file (station_id, obs_date, element, value, m_flag, q_flag, s_flag, obs_time) + source_file. loaded_at is not in the COPY list — it auto-fills from the table's DEFAULT now(). source_file is kept for future issue investigation (which file a row came from).
+
+Note COPY does the field-splitting itself, so parse_station does NOT split lines into fields — it only appends provenance. The line already ends in a trailing comma (empty obs_time), so appending ",{id}" lands the id in source_file and leaves obs_time empty: ...,X, -> ...,X,,ACW00011604 (9 fields).
+
+Verified end-to-end on ACW00011604: 1231 rows loaded, all columns correct, source_file populated, loaded_at stamped in UTC.
+
+Loader is currently append-only — upsert deferred COPY appends; re-running a station duplicates its rows. The intended design is upsert on (station_id, obs_date, element), which requires a UNIQUE constraint on those columns (deferred earlier to keep bulk loads fast and because raw isn't queried directly). Until that constraint + upsert exist, loads must not be re-run without truncating. This is the next hardening step, alongside the per-station loop over select_stations() and the load manifest for resumability.
+
+Open / undecided (next session)
+Loop all 491 stations (fetch -> parse -> load) with per-station error handling so one bad station doesn't kill the run.
+Idempotency: add UNIQUE (station_id, obs_date, element) + switch COPY-append to an upsert (e.g. COPY into a temp/staging table, then INSERT ... ON CONFLICT DO UPDATE into raw.observations).
+Load manifest (station_id, status, row_count, loaded_at) for resumability and the backfill-vs-incremental switch.
+Persist the 491 station list (still recomputed each run) — likely into raw.stations, which also needs loading from ghcnd-stations.txt.
+Change-detection skip strategy (always-pull window vs. content hash; Last-Modified already noted as weak).
+Guard: download_station_inventory can return None on a failed fetch; select_stations would then crash on "for line in lines". Add a guard.
