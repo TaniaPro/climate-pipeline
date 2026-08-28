@@ -36,6 +36,8 @@ Chose European + Mediterranean + Israel stations for the project. These
 regions had the strongest recent heat anomalies (2023-2026 heat domes) and
 have long, reliable station records — which matters because the project
 shows a long-term trend, not single hot days.
+> SUPERSEDED 2026-08-01: switched to 7 data-rich countries across 4 continents
+> (see "Went global instead of Europe-only"). Kept for history.
 
 **FIPS codes, not ISO**
 NOAA uses FIPS country codes, which differ from ISO. E.g. UK is "UK" in
@@ -376,25 +378,53 @@ and runs the chain for every station: select_stations() -> for each id ->
 download_station -> parse_station -> load_station. Orchestration kept separate
 from the piece functions so the pieces stay reusable/testable. A None guard skips
 any station whose download failed (if text is None: continue), so one bad fetch
-doesn't kill the whole run.
+doesn't kill the whole run. Progress is printed per station (i/total).
+
+**Full backfill loaded**
+Ran run_pipeline over all 491 stations. Result: 52,454,918 rows in
+raw.observations across 495 distinct stations. This is the whole ingestion layer
+working end to end at full scale.
+
+**Raw holds 495 stations (491 + 4 test leftovers) — filter in dbt, don't delete**
+The backfill table has 495 distinct stations, but the selected set is 491. The
+extra 4 are leftovers from earlier test loads (e.g. ACW00011604 and slice-test
+stations not in the 7-country set). Decided NOT to delete them from raw: a DELETE
+against 52M rows is riskier than the problem, and filtering belongs in dbt
+staging anyway. The staging model will restrict observations to the 491 (by
+joining against raw.stations / the selected list). Consistent with the
+raw-absorbs-everything principle — raw lands faithfully; curation happens
+downstream. A clean truncate + reload would also give exactly 491 if ever wanted.
+
+**Docs: README + PIPELINE.md**
+Added PIPELINE.md (end-to-end ingestion flow) and rewrote README.md, which was
+stale (still described the abandoned 8-country European set and marked Postgres
+"planned"). README now reflects the real 7-country global set, the working
+Postgres ingestion, accurate architecture, and a status checklist. Keep both
+current as later stages land.
 
 ---
 
 ## Open / undecided (current)
 
-- Full 491 run + verify counts / distinct stations (backfill).
 - Load manifest (station_id, status, row_count, loaded_at) for resumability and
-  the backfill-vs-incremental switch.
+  the backfill-vs-incremental switch. Would also let a re-run SKIP already-loaded
+  stations instead of reprocessing all 491.
 - Persist the 491 station list (still recomputed each run) — likely into
   raw.stations, which also needs loading from ghcnd-stations.txt.
 - Change-detection skip strategy (file-level hash vs. always-pull window;
   Last-Modified already noted as weak).
-- Trailing-window incremental load (re-pull ~90 days + upsert) once backfill done.
+- Trailing-window incremental load (re-pull ~90 days + upsert) now that backfill
+  is done.
+- Switch print -> logging in run_pipeline (prod-grade: timestamps, levels,
+  log-to-file; partly handled by Airflow later).
 - Guard: download_station_inventory can return None on a failed fetch;
   select_stations would then crash on "for line in lines". Add a guard.
+- dbt staging must filter observations to the 491 (excludes the 4 test leftovers).
 
 ## Resolved (was open, now done)
+- Full backfill: all 491 loaded — DONE (2026-08-27, 52.5M rows, 495 distinct
+  incl. 4 test leftovers).
 - Loop all 491 (fetch->parse->load) with per-station error handling — DONE
-  (run_pipeline with None guard, 2026-08-27).
+  (run_pipeline with None guard + progress, 2026-08-27).
 - Idempotency: UNIQUE (station_id, obs_date, element) + upsert — DONE (2026-08-27).
 - Parser + loader — DONE (parse_station 2026-08-22; upsert loader 2026-08-27).
