@@ -73,6 +73,7 @@ Station CSVs: /data/global-historical-climatology-network-daily/access/
 Metadata (inventory, stations): /pub/data/ghcn/daily/
 Wrong path returns an HTML error page with status 200 — so check content,
 not just status code.
+
 ## 2026-08-07
 
 **Target architecture (end-to-end shape)**
@@ -268,6 +269,7 @@ everything daily is infeasible so a delta is essential. At 491 stations,
 re-pulling a small window is trivial — the delta solves a problem we don't have,
 at the cost of an all-stations download and an architecture rewrite. Same
 scale-fit logic as the other rejections.
+
 **by_station file format: long/EAV, no header, 8 comma fields**
 Confirmed by fetching a real station (ACW00011604). The by_station CSV is
 already long/EAV — one row per station/date/element — NOT the wide format the
@@ -306,6 +308,7 @@ it once and builds indexed marts downstream). Indexes slow bulk loads, so none
 now. A UNIQUE (station_id, obs_date, element) constraint will be added later —
 required for the incremental upsert (ON CONFLICT) — which brings its own index
 for correctness, not query speed.
+> DONE 2026-08-27: the UNIQUE constraint was added and the loader now upserts.
 
 **Code structure: nothing runs on import**
 fetch_observations.py was a script with loose top-level code that ran (and hung)
@@ -314,36 +317,84 @@ download_station_inventory, parse_station, select_stations (selection logic
 wrapped, returns the station IDs) — with a __main__ block that runs the selection
 count only when executed directly.
 
-## Open / undecided (next session)
-- Persist the 491 station list. select_stations() recomputes the IDs from the
-  inventory every run; the concrete list isn't saved. Decide: recompute each run
-  vs. compute once and store (likely into raw.stations, which would double as the
-  authoritative project station list). Leaning toward storing.
-- Parser + loader. parse_station splits fetched text into rows; still need the
-  loader that inserts them into raw.observations, plus the load manifest / upsert
-  logic from earlier decisions.
-- Change-detection skip strategy. Always-pull trailing window vs. content hash.
-  Last-Modified already noted as weak (whole by_station set is regenerated in
-  bulk each cycle, so timestamps change even when data doesn't).
-
-
-
 ## 2026-08-22
 
-Loader: COPY into raw.observations, with source_file provenance load_station bulk-loads a station's parsed text into raw.observations via Postgres COPY (FROM STDIN, FORMAT csv), not row-by-row INSERT — COPY is built for bulk and the source grows over time (daily updates + revisions), so bulk is the right fit. psycopg2 (already installed) is the driver; copy_expert feeds the text through a cursor.
+**Loader: COPY into raw.observations, with source_file provenance**
+load_station bulk-loads a station's parsed text into raw.observations via
+Postgres COPY (FROM STDIN, FORMAT csv), not row-by-row INSERT — COPY is built
+for bulk and the source grows over time (daily updates + revisions), so bulk is
+the right fit. psycopg2 (already installed) is the driver; copy_expert feeds the
+text through a cursor.
 
-parse_station stamps each line with source_file (the station id) before loading, so COPY fills 9 columns: the 8 from the file (station_id, obs_date, element, value, m_flag, q_flag, s_flag, obs_time) + source_file. loaded_at is not in the COPY list — it auto-fills from the table's DEFAULT now(). source_file is kept for future issue investigation (which file a row came from).
+parse_station stamps each line with source_file (the station id) before loading,
+so COPY fills 9 columns: the 8 from the file (station_id, obs_date, element,
+value, m_flag, q_flag, s_flag, obs_time) + source_file. loaded_at is not in the
+COPY list — it auto-fills from the table's DEFAULT now(). source_file is kept for
+future issue investigation (which file a row came from).
 
-Note COPY does the field-splitting itself, so parse_station does NOT split lines into fields — it only appends provenance. The line already ends in a trailing comma (empty obs_time), so appending ",{id}" lands the id in source_file and leaves obs_time empty: ...,X, -> ...,X,,ACW00011604 (9 fields).
+Note COPY does the field-splitting itself, so parse_station does NOT split lines
+into fields — it only appends provenance. The line already ends in a trailing
+comma (empty obs_time), so appending ",{id}" lands the id in source_file and
+leaves obs_time empty: ...,X, -> ...,X,,ACW00011604 (9 fields).
 
-Verified end-to-end on ACW00011604: 1231 rows loaded, all columns correct, source_file populated, loaded_at stamped in UTC.
+Verified end-to-end on ACW00011604: 1231 rows loaded, all columns correct,
+source_file populated, loaded_at stamped in UTC.
+> SUPERSEDED 2026-08-27: the append-only COPY-straight-into-raw.observations was
+> replaced by the idempotent COPY-to-staging + upsert (see 2026-08-27). The
+> provenance / column-mapping details above still hold.
 
-Loader is currently append-only — upsert deferred COPY appends; re-running a station duplicates its rows. The intended design is upsert on (station_id, obs_date, element), which requires a UNIQUE constraint on those columns (deferred earlier to keep bulk loads fast and because raw isn't queried directly). Until that constraint + upsert exist, loads must not be re-run without truncating. This is the next hardening step, alongside the per-station loop over select_stations() and the load manifest for resumability.
+## 2026-08-27
 
-Open / undecided (next session)
-Loop all 491 stations (fetch -> parse -> load) with per-station error handling so one bad station doesn't kill the run.
-Idempotency: add UNIQUE (station_id, obs_date, element) + switch COPY-append to an upsert (e.g. COPY into a temp/staging table, then INSERT ... ON CONFLICT DO UPDATE into raw.observations).
-Load manifest (station_id, status, row_count, loaded_at) for resumability and the backfill-vs-incremental switch.
-Persist the 491 station list (still recomputed each run) — likely into raw.stations, which also needs loading from ghcnd-stations.txt.
-Change-detection skip strategy (always-pull window vs. content hash; Last-Modified already noted as weak).
-Guard: download_station_inventory can return None on a failed fetch; select_stations would then crash on "for line in lines". Add a guard.
+**Idempotent loader via upsert (COPY to staging, then INSERT ON CONFLICT)**
+Reworked load_station so re-running is safe (no duplicate rows). COPY can only
+append and can't do ON CONFLICT, so the loader now: (1) CREATE TEMP TABLE staging
+with the 9 loaded columns; (2) COPY the text into staging (fast bulk load); (3)
+INSERT INTO raw.observations SELECT ... FROM staging ON CONFLICT (station_id,
+obs_date, element) DO UPDATE SET value/flags/obs_time/source_file = EXCLUDED.*.
+New rows insert; rows matching an existing key update in place. Temp table is
+auto-dropped at session end (no cleanup, no cross-run collision). loaded_at is
+not overwritten on update — keeps its original insert time.
+
+Prerequisite done first: TRUNCATEd the one-station test data (clean slate), then
+added UNIQUE (station_id, obs_date, element) on raw.observations — the constraint
+the upsert keys on.
+
+Verified idempotent: loaded ACW00011604 (1231 rows), loaded the exact same data
+again, count stayed 1231 — the second load updated in place instead of
+duplicating.
+
+**Content hash considered and rejected (for now)**
+Considered hashing rows/files to detect changes. Rejected: the upsert already
+makes re-loads correct (a revised value overwrites via DO UPDATE), so a per-row
+hash is redundant. A file-level hash would only help SKIP unchanged files (an
+optimization, not correctness) and belongs in the load manifest, not in
+parse_station — deferred to the change-detection decision.
+
+**run_pipeline() orchestrates the full loop**
+New file ingestion_pipeline_run.py imports the functions from fetch_observations
+and runs the chain for every station: select_stations() -> for each id ->
+download_station -> parse_station -> load_station. Orchestration kept separate
+from the piece functions so the pieces stay reusable/testable. A None guard skips
+any station whose download failed (if text is None: continue), so one bad fetch
+doesn't kill the whole run.
+
+---
+
+## Open / undecided (current)
+
+- Full 491 run + verify counts / distinct stations (backfill).
+- Load manifest (station_id, status, row_count, loaded_at) for resumability and
+  the backfill-vs-incremental switch.
+- Persist the 491 station list (still recomputed each run) — likely into
+  raw.stations, which also needs loading from ghcnd-stations.txt.
+- Change-detection skip strategy (file-level hash vs. always-pull window;
+  Last-Modified already noted as weak).
+- Trailing-window incremental load (re-pull ~90 days + upsert) once backfill done.
+- Guard: download_station_inventory can return None on a failed fetch;
+  select_stations would then crash on "for line in lines". Add a guard.
+
+## Resolved (was open, now done)
+- Loop all 491 (fetch->parse->load) with per-station error handling — DONE
+  (run_pipeline with None guard, 2026-08-27).
+- Idempotency: UNIQUE (station_id, obs_date, element) + upsert — DONE (2026-08-27).
+- Parser + loader — DONE (parse_station 2026-08-22; upsert loader 2026-08-27).

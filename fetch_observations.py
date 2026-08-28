@@ -100,18 +100,46 @@ def parse_station(text, station_id):
 
 # step 5: bulk-load one station's parsed text into raw.observations via COPY
 def load_station(text):
-    conn = psycopg2.connect(dbname="climate")   # open a connection to the database
-    cursor = conn.cursor()                      # get a cursor to run commands on it
+    conn = psycopg2.connect(dbname="climate")
+    cursor = conn.cursor()
 
-    sql = """
-        COPY raw.observations
+    # 1. temp staging table — same 9 columns we COPY (no loaded_at).
+    #    Temp = exists only for this connection, auto-dropped after.
+    cursor.execute("""
+        CREATE TEMP TABLE staging (
+            station_id text, obs_date text, element text, value text,
+            m_flag text, q_flag text, s_flag text, obs_time text, source_file text
+        )
+    """)
+
+    # 2. bulk-load the incoming text into staging (COPY can't upsert,
+    #    so we land it here first).
+    cursor.copy_expert(
+        "COPY staging FROM STDIN WITH (FORMAT csv)",
+        io.StringIO(text)
+    )
+
+    # 3. upsert staging -> raw.observations. New rows insert; rows whose
+    #    (station_id, obs_date, element) already exist get their values
+    #    overwritten instead of duplicated.
+    cursor.execute("""
+        INSERT INTO raw.observations
             (station_id, obs_date, element, value,
              m_flag, q_flag, s_flag, obs_time, source_file)
-        FROM STDIN WITH (FORMAT csv)
-    """
-    cursor.copy_expert(sql, io.StringIO(text)) # query execution
+        SELECT station_id, obs_date, element, value,
+               m_flag, q_flag, s_flag, obs_time, source_file
+        FROM staging
+        ON CONFLICT (station_id, obs_date, element)
+        DO UPDATE SET
+            value       = EXCLUDED.value,
+            m_flag      = EXCLUDED.m_flag,
+            q_flag      = EXCLUDED.q_flag,
+            s_flag      = EXCLUDED.s_flag,
+            obs_time    = EXCLUDED.obs_time,
+            source_file = EXCLUDED.source_file
+    """)
 
-    conn.commit()   # save (commit is on the connection)
-    cursor.close()  # done with the cursor
-    conn.close()    # close connection
+    conn.commit()
+    cursor.close()
+    conn.close()
 
