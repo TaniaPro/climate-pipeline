@@ -402,6 +402,44 @@ stale (still described the abandoned 8-country European set and marked Postgres
 Postgres ingestion, accurate architecture, and a status checklist. Keep both
 current as later stages land.
 
+## 2026-08-29
+
+**raw.stations loaded from ghcnd-stations.txt (491 stations)**
+Built the station-metadata side of the raw layer, in a new file fetch_stations.py:
+  1. download_station_meta_data() — fetches ghcnd-stations.txt from S3 (plain
+     .txt, not gzipped), returns lines. Same S3-source pattern as the inventory.
+  2. parse_stations_meta_data() — fixed-width parse (slice by column position,
+     strip padding), filtered to our 491 via set(select_stations()) for O(1)
+     membership against ~127k lines. Returns (station_id, latitude, longitude,
+     elevation, state, name) tuples.
+  3. load_stations() — upserts into raw.stations.
+Column positions verified against a real line (repr), not just docs:
+  [0:11] id, [12:20] lat, [21:30] lon, [31:37] elev, [38:40] state, [41:71] name.
+Verified: 491 rows in raw.stations, all fields clean, loaded_at stamped UTC.
+
+**station_id is the PRIMARY KEY on raw.stations**
+Unlike raw.observations (a station has thousands of rows, so the key is the
+composite station_id+obs_date+element), each station appears exactly once here,
+so station_id is a natural primary key — enforces uniqueness, indexes the join
+column dbt will use, and enables the upsert.
+
+**Simple upsert load (execute_values + ON CONFLICT), not COPY-to-staging**
+raw.stations is tiny (491 rows), so the bulk COPY-to-staging machinery used for
+the 52M-row observations isn't needed. Used psycopg2 execute_values to insert all
+rows in one statement with ON CONFLICT (station_id) DO UPDATE. Right tool for the
+scale — bulk COPY for millions of rows, single-statement upsert for hundreds.
+
+**Orchestrator split into two named pipelines**
+ingestion_pipeline_run.py now has run_observations_pipeline() (loops 491 stations:
+download -> parse -> load, with None-skip + progress) and run_stations_pipeline()
+(one file, all stations at once: parse -> load — no loop needed). Renamed from the
+old generic run_pipeline.
+
+**Raw layer complete**
+Both raw tables are now loaded: raw.observations (52.5M rows) and raw.stations
+(491). This is the full raw ingestion layer — the foundation for dbt
+staging/marts.
+
 ---
 
 ## Open / undecided (current)
@@ -409,8 +447,6 @@ current as later stages land.
 - Load manifest (station_id, status, row_count, loaded_at) for resumability and
   the backfill-vs-incremental switch. Would also let a re-run SKIP already-loaded
   stations instead of reprocessing all 491.
-- Persist the 491 station list (still recomputed each run) — likely into
-  raw.stations, which also needs loading from ghcnd-stations.txt.
 - Change-detection skip strategy (file-level hash vs. always-pull window;
   Last-Modified already noted as weak).
 - Trailing-window incremental load (re-pull ~90 days + upsert) now that backfill
@@ -428,3 +464,5 @@ current as later stages land.
   (run_pipeline with None guard + progress, 2026-08-27).
 - Idempotency: UNIQUE (station_id, obs_date, element) + upsert — DONE (2026-08-27).
 - Parser + loader — DONE (parse_station 2026-08-22; upsert loader 2026-08-27).
+- raw.stations loaded from ghcnd-stations.txt (491, PK on station_id) — DONE
+  (2026-08-29). Also serves as the authoritative project station list.
