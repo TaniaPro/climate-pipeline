@@ -1,6 +1,8 @@
 from fetch_observations import select_stations, download_station, parse_station, load_station
+from fetch_stations import parse_stations_meta_data, load_stations
 
-def run_pipeline():
+
+def run_observations_pipeline():
     station_ids_list=select_stations()
 
     for i, station_id in enumerate(station_ids_list, start=1):
@@ -13,3 +15,8 @@ def run_pipeline():
         load_station(station_info_parsed)
 
         print(f"loaded {station_id} ({i}/{len(station_ids_list)})")
+
+def run_stations_pipeline():
+    rows = parse_stations_meta_data()
+    load_stations(rows)
+    print(f"loaded {len(rows)} stations")
