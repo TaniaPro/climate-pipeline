@@ -440,13 +440,50 @@ Both raw tables are now loaded: raw.observations (52.5M rows) and raw.stations
 (491). This is the full raw ingestion layer — the foundation for dbt
 staging/marts.
 
+## 2026-09-12
+
+**Load manifest (meta._load_manifest) — resumability + per-station status**
+Added a dedicated `meta` schema (operational bookkeeping, kept separate from
+`raw` data) with a load-manifest table: station_id (PK), status, error,
+row_count, updated_at (timestamptz DEFAULT now()). One row per station recording
+its load outcome. Statuses tracked: 'success' and 'failed' (skipped 'in_progress'
+— idempotent upserts make a half-load safe to redo, so absence-of-success already
+signals "not done"; in_progress would only add live-run visibility, not
+correctness).
+
+Three helper functions (record_manifest.py):
+  - record_manifest(station_id, status, error, row_count) — upserts the outcome
+    (ON CONFLICT (station_id) DO UPDATE, so a retry overwrites the prior attempt;
+    updated_at = now() on update, not EXCLUDED, to stamp the latest attempt).
+  - is_loaded(station_id) — SELECT 1 ... WHERE status='success'; returns True/False.
+    Only 'success' counts, so failed stations are retried, not skipped.
+  - load_observations now returns cursor.rowcount (rows upserted) so the loop can
+    record row_count.
+
+Wired into run_observations_pipeline: per station — skip if is_loaded (resumability),
+record 'failed' if download returns None, else load + record 'success' with row_count.
+Verified: loaded a slice, manifest populated with real row counts; is_loaded returns
+True for a recorded station (would skip it) and False for failed/unrecorded ones.
+
+**Deterministic station selection (sorted)**
+select_stations() built the list from a set (unordered), so both the selected 491
+AND their order varied run to run — which made slice-testing misleading and
+weakened resumable ordering. Fixed by iterating sorted(both) in the cap loop
+(makes WHICH 75-per-country survive deterministic) and returning sorted(station_ids).
+Now the same 491 in the same order every run. Verified: 491, same per-country
+counts (AS/GM/JA/SP/US=75, FR 68, CA 48), first IDs stable (ASM00094299...).
+
+**Function rename for clarity**
+load_station -> load_observations (loads observation rows) and load_stations ->
+load_station_metadata (loads the stations table). The one-letter singular/plural
+difference was a footgun. Pure rename across definitions, imports, call sites,
+and docs; DECISIONS.md left unchanged (records the names as they were at each
+dated decision).
+
 ---
 
 ## Open / undecided (current)
 
-- Load manifest (station_id, status, row_count, loaded_at) for resumability and
-  the backfill-vs-incremental switch. Would also let a re-run SKIP already-loaded
-  stations instead of reprocessing all 491.
 - Change-detection skip strategy (file-level hash vs. always-pull window;
   Last-Modified already noted as weak).
 - Trailing-window incremental load (re-pull ~90 days + upsert) now that backfill
@@ -466,3 +503,5 @@ staging/marts.
 - Parser + loader — DONE (parse_station 2026-08-22; upsert loader 2026-08-27).
 - raw.stations loaded from ghcnd-stations.txt (491, PK on station_id) — DONE
   (2026-08-29). Also serves as the authoritative project station list.
+- Load manifest (meta._load_manifest) + wired into pipeline (skip/record) — DONE
+  (2026-09-12). Also made station selection deterministic (sorted).

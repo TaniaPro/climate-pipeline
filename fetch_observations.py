@@ -55,7 +55,7 @@ def select_stations():
     station_ids = []
     per_country = {} # count stations per country
 
-    for station in both:
+    for station in sorted(both):
         country = station[:2]
 
         # First station seen:
@@ -64,7 +64,7 @@ def select_stations():
             station_ids.append(station)
             per_country[country] = count + 1
 
-    return station_ids
+    return sorted(station_ids)
 
 # step 3: fetches relevant station's observation text
 # The output of this function is one giant string, e.g. "ACW00011604,19490101,TMAX,289,,,X,\nACW00011604,19490101,PRCP,0,,,X,\n..."
@@ -99,7 +99,7 @@ def parse_station(text, station_id):
 
 
 # step 5: bulk-load one station's parsed text into raw.observations via COPY
-def load_station(text):
+def load_observations(text):
     conn = psycopg2.connect(dbname="climate")
     cursor = conn.cursor()
 
@@ -138,8 +138,10 @@ def load_station(text):
             obs_time    = EXCLUDED.obs_time,
             source_file = EXCLUDED.source_file
     """)
-
+    count = cursor.rowcount
+    
     conn.commit()
     cursor.close()
     conn.close()
+    return count
 

@@ -22,7 +22,7 @@ loads them into Postgres (raw.observations), idempotently.
             └─ appends source_file (the station id) to each line
             └─ returns CSV text with 9 fields per line
 
-        load_station(text)
+        load_observations(text)
             └─ CREATE TEMP TABLE staging (9 columns)
             └─ COPY the text into staging  (fast bulk load)
             └─ INSERT INTO raw.observations SELECT ... FROM staging

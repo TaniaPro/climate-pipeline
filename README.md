@@ -62,7 +62,7 @@ The ingestion layer is working end to end:
   decompresses gzip in memory, returns the text (or `None` on a failed fetch).
 - **`parse_station(text, id)`** — stamps each row with its source file
   (provenance) before loading.
-- **`load_station(text)`** — idempotent bulk load: `COPY` into a temporary
+- **`load_observations(text)`** — idempotent bulk load: `COPY` into a temporary
   staging table, then `INSERT … ON CONFLICT (station_id, obs_date, element) DO
   UPDATE`. New rows insert; existing rows update in place — re-running never
   duplicates.

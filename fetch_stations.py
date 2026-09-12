@@ -52,7 +52,7 @@ def parse_stations_meta_data():
 
 # step 3: upsert the station rows into raw.stations. New stations insert;
 # existing ones (same station_id primary key) update in place — idempotent.
-def load_stations(rows):
+def load_station_metadata(rows):
     conn = psycopg2.connect(dbname="climate")
     cursor = conn.cursor()
 
