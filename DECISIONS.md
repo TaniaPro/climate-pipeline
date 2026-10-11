@@ -396,6 +396,8 @@ staging anyway. The staging model will restrict observations to the 491 (by
 joining against raw.stations / the selected list). Consistent with the
 raw-absorbs-everything principle — raw lands faithfully; curation happens
 downstream. A clean truncate + reload would also give exactly 491 if ever wanted.
+> SUPERSEDED 2026-10-11: orphans grew to 245 stations / 28.7M rows after the
+> selection change; deleted from raw instead. See 2026-10-11.
 
 **Docs: README + PIPELINE.md**
 Added PIPELINE.md (end-to-end ingestion flow) and rewrote README.md, which was
@@ -589,6 +591,30 @@ lock and restarted; automatic WAL recovery ran cleanly. Also had to `brew update
 first — `brew services` was broken by a formula/Homebrew version mismatch
 ("undefined method 'stop_timeout'").
 
+**Deleted orphan observations from raw (28.7M rows, 245 stations)**
+After the roster-drift fix, raw.observations still held data for 245 stations
+not in the roster — residue from abandoned selections (pre-sort runs, test loads).
+That was 28,713,506 rows, roughly a third of the table. The staging filter hid
+them from analysis, but every stg_observations read still scanned and discarded
+them.
+
+Reversed the 2026-08-27 "filter in dbt, don't delete" decision: that was made for
+4 test leftovers, where a DELETE wasn't worth the risk. At 245 stations / 28.7M
+rows the trade flipped — these aren't source data for this project, they're
+artifacts of a selection no longer in use, and deleting is safe because raw is
+fully re-fetchable from S3.
+
+Process: counted first, then deleted inside a transaction (BEGIN), confirmed the
+DELETE count matched the pre-count exactly and distinct stations = 491, then
+COMMIT. Ran VACUUM FULL afterwards: DELETE only marks rows dead (MVCC keeps old
+versions for open transactions); VACUUM FULL rewrites the table without them and
+returns the disk space. A one-off for a mass delete; routine cleanup is left to
+autovacuum.
+
+Also removed 9 stale manifest rows (stations no longer in the roster), same
+count-then-transaction pattern. Result: raw.stations, raw.observations,
+meta._load_manifest and stg_observations all agree on the same 491 stations.
+
 ---
 
 ## Open / undecided (current)
@@ -647,3 +673,5 @@ mean anything.
   ref('stg_stations') clause).
 - Roster made hermetic: pipeline reads the frozen roster via get_roster(), one
   source of truth — DONE (2026-10-11).
+- Orphan observations removed from raw (28.7M rows, 245 stations) + stale manifest
+  rows; all layers consistent at 491 — DONE (2026-10-11).
