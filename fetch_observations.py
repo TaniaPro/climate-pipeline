@@ -24,7 +24,12 @@ def download_station_inventory():
         print(f"Failed: status {response.status_code}")
         return None
 
-# step 2: filters those lines to selected station IDs
+# step 2: ONE-TIME roster-building tool — NOT called by the observations pipeline.
+# That reads the frozen roster from raw.stations via get_roster(). This function
+# computes the selection from the inventory; rebuilding the roster (truncate
+# raw.stations + run_stations_pipeline) is a deliberate act that changes the
+# analysis population. Changing the criteria here without rebuilding causes
+# roster/data drift.
 def select_stations():
     # FIPS country codes: data-rich countries across 4 continents (North America,
     # Asia, Oceania, Europe), chosen for strong warming signal and long records.

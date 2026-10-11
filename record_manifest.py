@@ -38,3 +38,19 @@ def is_loaded(station_id):
     conn.close()
 
     return result is not None
+
+
+def get_roster():
+    conn = psycopg2.connect(dbname="climate")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT station_id FROM raw.stations ORDER BY station_id
+    """)
+    result = cursor.fetchall()
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return [row[0] for row in result]
