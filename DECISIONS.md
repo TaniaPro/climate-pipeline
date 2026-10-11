@@ -251,6 +251,8 @@ same style as ghcnd-inventory.txt:
   ID 1-11, LATITUDE 13-20, LONGITUDE 22-30, ELEVATION 32-37, STATE 39-40,
   NAME 42-71, GSN 73-75, HCN/CRN 77-79, WMO 81-85.
 Lives on S3 at noaa-ghcn-pds/ghcnd-stations.txt (consistent with S3 source).
+> Positions verified against a real line on 2026-08-29 (see that entry) — the
+> Python slices are [0:11], [12:20], [21:30], [31:37], [38:40], [41:71].
 
 **Considered and rejected: superghcnd_diff for change-detection**
 superghcnd is a separate distribution of the same data as one merged file,
@@ -472,6 +474,9 @@ weakened resumable ordering. Fixed by iterating sorted(both) in the cap loop
 (makes WHICH 75-per-country survive deterministic) and returning sorted(station_ids).
 Now the same 491 in the same order every run. Verified: 491, same per-country
 counts (AS/GM/JA/SP/US=75, FR 68, CA 48), first IDs stable (ASM00094299...).
+> NOTE 2026-09-25: this change is what caused the roster/data drift bug — the
+> selection changed after raw.stations had already been loaded from the old one.
+> See "BUG: roster/data drift" under 2026-09-25.
 
 **Function rename for clarity**
 load_station -> load_observations (loads observation rows) and load_stations ->
@@ -480,28 +485,165 @@ difference was a footgun. Pure rename across definitions, imports, call sites,
 and docs; DECISIONS.md left unchanged (records the names as they were at each
 dated decision).
 
+## 2026-09-25
+
+**dbt set up and connected (climate_dbt project)**
+Installed dbt-core 1.12.5 + dbt-postgres 1.11.0 in the project venv. `dbt init`
+scaffolded climate_dbt/ but its interactive password prompt looped (the local
+Postgres had no password to give), so the connection profile was written by hand
+in ~/.dbt/profiles.yml — which lives outside the repo, so credentials never reach
+git. The profile block name must match `profile:` in dbt_project.yml.
+
+Key thing to remember: the `schema: analytics` line in profiles.yml is what
+directs where dbt builds EVERY model — nothing in the SQL says it. dbt wraps your
+SELECT as `CREATE VIEW <target_schema>.<filename>`, taking the schema from the
+profile and the object name from the .sql filename.
+
+**First staging models: stg_stations, stg_observations**
+Declared raw.observations and raw.stations as dbt sources (_sources.yml), then:
+  - stg_stations — casts latitude/longitude/elevation text->numeric, NULLIF('')
+    on state.
+  - stg_observations — to_date(obs_date,'YYYYMMDD') (a plain ::date cast FAILS on
+    the no-dashes format), value::integer, NULLIF('') on the flags, and filters to
+    the 491 with `WHERE station_id IN (SELECT station_id FROM {{ ref('stg_stations') }})`.
+Both default to views. {{ source() }} references a raw table; {{ ref() }} references
+another dbt model (and gives dbt the dependency order).
+
+Why filter in staging when ingestion already selects 491: ingestion controls what
+gets FETCHED, but raw accumulates strays (test loads, older selections). Staging
+enforces "exactly the 491" rather than trusting upstream — each layer defends its
+own correctness instead of assuming the one above is clean.
+
+**BUG: roster/data drift after changing select_stations() — stg_observations
+showed only 312 of 491**
+Symptom: stg_stations = 491, raw.observations = 736 distinct stations, but
+stg_observations = 312; the manifest claimed 500 successes and zero failures.
+
+Root cause: the 2026-09-12 sorting change. Adding sorted(both) before the
+per-country cap changed WHICH 75 stations survive per country, so select_stations()
+began returning a different 491. raw.stations (loaded 08-29, pre-sort) still held
+the OLD roster, while later pipeline runs loaded observations for the NEW 491. The
+dbt filter matched new data against the stale roster, leaving only the overlap.
+Counts decomposed exactly (491 + 9 + 236 = 736), confirming a selection/temporal
+mismatch — not an ID-format problem and not a load failure.
+
+Fix: truncate raw.stations, reload from the current select_stations(). Truncate was
+required because load_station_metadata upserts and never deletes — a plain re-run
+would have left the old stations in place. After the reload, stg_observations = 491.
+No observation re-fetch was needed: the data was already there; only the roster was
+stale.
+
+**Jinja typo in stg_stations.sql**
+`{ { source('raw','stations') } }` (spaces inside the braces) — invalid Jinja that
+would have broken the next dbt run. The live Postgres view still worked because it
+had compiled before the edit. Fixed to `{{ source(...) }}`.
+
+**Fixed: 0-row loads were being recorded as "success"**
+load_observations returns cursor.rowcount, but the pipeline recorded "success"
+regardless of the value. A station whose download returned HTTP 200 with an empty
+body would load 0 rows, be marked success, and then be skipped forever by
+is_loaded — a silent, permanent gap (only the status code was checked, never the
+content). Exactly the class of confusion that caused the roster-drift debugging
+above, so fixed rather than deferred: a 0-row load is now recorded as failed
+("loaded 0 rows") and the station is retried on the next run.
+
+**Credentials: removed the DB password entirely**
+The Postgres password had been exposed, so it was retired. Rather than rotating it,
+removed it altogether (ALTER USER ... WITH PASSWORD NULL) — the database is
+local-only, listening on localhost, holding public NOAA data, and uses trust auth,
+so a password guarded only against an attacker already on the machine.
+profiles.yml now has `user: "{{ env_var('DBT_USER') }}"` and `pass: ""`.
+Note: dbt-postgres REQUIRES the `pass` key to exist — omitting it fails with
+"'password' is a required property" — so it's present but empty. No secrets in
+profiles.yml at all.
+
+## 2026-10-11
+
+**Frozen roster: raw.stations is the single source of truth**
+The roster-drift fix on 09-25 (rebuild raw.stations) was not hermetic — it relied
+on remembering to rebuild whenever selection criteria changed. That discipline had
+already failed once. Worse, NOAA adding stations upstream could shift which 75
+survive the per-country cap, changing the 491 with no code change at all.
+
+Decided the roster should be STABLE, not live: a warming-trend analysis compares
+the same places across years, so a moving station set would muddy the signal.
+Changing the population should be a deliberate act, not a side effect of an
+upstream refresh.
+
+Implementation: added get_roster() (SELECT station_id FROM raw.stations ORDER BY
+station_id, flattened to a list of strings). run_observations_pipeline() now calls
+get_roster() instead of select_stations(). select_stations() stays as the one-time
+roster-BUILDING tool, documented as such, called only via run_stations_pipeline().
+
+This removes the two-sources-of-truth (computed vs. stored) that caused the drift
+bug. There is now only one list, so there is nothing to drift against — structural,
+not disciplinary.
+
+**Ops note: stale postmaster.pid blocked Postgres startup**
+After a reboot, Postgres refused to start: "lock file postmaster.pid already
+exists ... Is another postmaster (PID 726) running?". PID 726 turned out to be
+BTLEServerAgent — the OS had recycled the PID from an old Postgres run, so the
+stale lock pointed at an unrelated process. Verified with `ps -p 726` BEFORE
+deleting (removing a live server's lock file can corrupt data), then removed the
+lock and restarted; automatic WAL recovery ran cleanly. Also had to `brew update`
+first — `brew services` was broken by a formula/Homebrew version mismatch
+("undefined method 'stop_timeout'").
+
 ---
 
 ## Open / undecided (current)
+
+**Data quality / cleaning (not yet designed — next big staging decision)**
+raw is deliberately unfiltered, so staging has to decide what "clean" means.
+Known things to handle, none of them yet implemented:
+  - q_flag: GHCN sets a quality-control flag on values that FAILED a QC check.
+    Those values are suspect and are normally excluded from analysis. Decide
+    whether stg_observations filters to q_flag IS NULL, or keeps them and lets
+    marts decide.
+  - Missing-value sentinels: GHCN uses -9999 for missing in some distributions.
+    Confirm whether the by_station CSVs contain them and strip if so, or a single
+    bad row poisons any average.
+  - Physically implausible values (e.g. TMAX of 60C, negative PRCP) that pass QC
+    but shouldn't enter a trend.
+  - Partial years / sparse stations: a station-year with only a handful of days
+    shouldn't be averaged as if it were a full year. Decide a minimum-coverage
+    threshold before yearly aggregation.
+  - Elements beyond TMAX/PRCP are present in raw; marts should select explicitly
+    rather than aggregate whatever is there.
+Decide these as staging/marts rules, documented here, before the trend numbers
+mean anything.
 
 - Change-detection skip strategy (file-level hash vs. always-pull window;
   Last-Modified already noted as weak).
 - Trailing-window incremental load (re-pull ~90 days + upsert) now that backfill
   is done.
-- Switch print -> logging in run_pipeline (prod-grade: timestamps, levels,
-  log-to-file; partly handled by Airflow later).
+- Switch print -> logging in run_observations_pipeline (prod-grade: timestamps,
+  levels, log-to-file; partly handled by Airflow later).
 - Guard: download_station_inventory can return None on a failed fetch;
   select_stations would then crash on "for line in lines". Add a guard.
-- dbt staging must filter observations to the 491 (excludes the 4 test leftovers).
+- Materialization: stg_observations is a view over 52M rows. Consider switching to
+  table if marts queries get slow.
+- dbt test to catch roster/data gaps loudly (e.g. no station marked success in the
+  manifest with zero rows). Must run AFTER the observations load, or a legitimately
+  new station would false-alarm.
+- Next phase: marts layer — pivot long->wide (TMAX/PRCP as columns), aggregate by
+  year, compute the warming trend.
 
 ## Resolved (was open, now done)
-- Full backfill: all 491 loaded — DONE (2026-08-27, 52.5M rows, 495 distinct
-  incl. 4 test leftovers).
+- Full backfill: all 491 loaded — DONE (2026-08-27, 52.5M rows).
 - Loop all 491 (fetch->parse->load) with per-station error handling — DONE
-  (run_pipeline with None guard + progress, 2026-08-27).
+  (None guard + progress, 2026-08-27).
 - Idempotency: UNIQUE (station_id, obs_date, element) + upsert — DONE (2026-08-27).
 - Parser + loader — DONE (parse_station 2026-08-22; upsert loader 2026-08-27).
 - raw.stations loaded from ghcnd-stations.txt (491, PK on station_id) — DONE
   (2026-08-29). Also serves as the authoritative project station list.
 - Load manifest (meta._load_manifest) + wired into pipeline (skip/record) — DONE
   (2026-09-12). Also made station selection deterministic (sorted).
+- dbt installed, connected, first staging models built — DONE (2026-09-25).
+- Roster/data drift diagnosed and fixed by rebuilding raw.stations — DONE
+  (2026-09-25).
+- 0-row loads recorded as success (silent skip-forever gap) — FIXED (2026-09-25).
+- dbt staging filters observations to the 491 — DONE (2026-09-25, the WHERE ...
+  ref('stg_stations') clause).
+- Roster made hermetic: pipeline reads the frozen roster via get_roster(), one
+  source of truth — DONE (2026-10-11).
