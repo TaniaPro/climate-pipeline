@@ -11,3 +11,4 @@ SELECT
     loaded_at
 FROM {{ source('raw', 'observations') }}
 WHERE station_id IN (SELECT station_id FROM {{ ref('stg_stations') }})
+AND (q_flag IS NULL OR q_flag = '')
