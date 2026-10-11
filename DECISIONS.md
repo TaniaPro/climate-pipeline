@@ -615,17 +615,44 @@ Also removed 9 stale manifest rows (stations no longer in the roster), same
 count-then-transaction pattern. Result: raw.stations, raw.observations,
 meta._load_manifest and stg_observations all agree on the same 491 stations.
 
+**Drop QC-flagged observations in staging (q_flag)**
+GHCN sets q_flag on a value that FAILED one of NOAA's quality checks (e.g. I =
+internal consistency, D = duplicate, O = climatological outlier, S = spatial
+consistency vs. neighbours, X = bounds check). Measured on TMAX/PRCP: 25,960,621
+clean values vs ~30,300 flagged — about 0.1%.
+
+Decision: drop them. One impossible value (say a 70C TMAX) skews a station's
+yearly average upward — the worst kind of error in a warming-trend analysis —
+while losing 0.1% of the data costs almost nothing.
+
+Where: in staging (stg_observations), not in each mart. Filtering per mart would
+make every future mart responsible for REMEMBERING `q_flag IS NULL`; forget it once
+and that mart silently includes bad values. That's the same remember-to-do-X
+pattern that caused the roster drift. Filtering once in staging makes every mart
+clean by construction. Nothing is lost: raw still holds every flagged value for
+audit.
+
+Implementation: added `AND (q_flag IS NULL OR q_flag = '')` to the WHERE clause.
+Two traps worth remembering:
+  - WHERE reads the RAW column, not the SELECT's NULLIF(...) alias — so the check
+    must treat both NULL and '' as "no flag".
+  - The parentheses are required: SQL evaluates AND before OR, so without them
+    `... AND q_flag IS NULL OR q_flag = ''` would let any empty-flag row through
+    regardless of station, silently breaking the 491 filter.
+Also: dbt models must NOT end with a semicolon — dbt wraps the SELECT in
+CREATE VIEW ... AS ( ... ), and a `;` inside ends it early.
+
+Verified: after rebuild, q_flag shows only NULL with 25,960,621 rows — exactly the
+pre-filter clean count, so no clean row was lost — and distinct stations = 491.
+
 ---
 
 ## Open / undecided (current)
 
 **Data quality / cleaning (not yet designed — next big staging decision)**
 raw is deliberately unfiltered, so staging has to decide what "clean" means.
-Known things to handle, none of them yet implemented:
-  - q_flag: GHCN sets a quality-control flag on values that FAILED a QC check.
-    Those values are suspect and are normally excluded from analysis. Decide
-    whether stg_observations filters to q_flag IS NULL, or keeps them and lets
-    marts decide.
+Known things to handle:
+  - q_flag: DONE 2026-10-11 — flagged values dropped in stg_observations.
   - Missing-value sentinels: GHCN uses -9999 for missing in some distributions.
     Confirm whether the by_station CSVs contain them and strip if so, or a single
     bad row poisons any average.
@@ -675,3 +702,4 @@ mean anything.
   source of truth — DONE (2026-10-11).
 - Orphan observations removed from raw (28.7M rows, 245 stations) + stale manifest
   rows; all layers consistent at 491 — DONE (2026-10-11).
+- QC-flagged values (q_flag) dropped in staging, not per mart — DONE (2026-10-11).
