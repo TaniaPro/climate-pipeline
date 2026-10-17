@@ -645,26 +645,95 @@ CREATE VIEW ... AS ( ... ), and a `;` inside ends it early.
 Verified: after rebuild, q_flag shows only NULL with 25,960,621 rows — exactly the
 pre-filter clean count, so no clean row was lost — and distinct stations = 491.
 
+## 2026-10-17
+
+**No missing-value sentinels (-9999) — verified, nothing to clean**
+GHCN's -9999 "no data" code belongs to the fixed-width .dly distribution. Checked
+stg_observations: 0 rows with value = -9999. The by_station CSVs simply OMIT days
+with no data — a missing day is a missing row, not a fake value. Recorded as a
+finding rather than skipped. Consequence that matters later: missing days are
+invisible, so completeness has to be measured by counting rows against the
+calendar, never by looking for a sentinel.
+
+**No extra plausibility filter on top of NOAA's QC**
+Checked the extremes in clean data (values in tenths): TMAX -52.1C to 52.2C,
+PRCP 0 to 806.0 mm/day. All plausible: 52C occurs in Australian/US deserts; a
+daily HIGH of -52C occurs in Canada's far north in deep winter; the 806 mm day is
+Owase, Japan, 1968-09-26 — one of Japan's wettest places, peak typhoon season,
+and its q_flag is empty (passed every NOAA check). Its `I` is in s_flag, the
+SOURCE flag, not a quality flag.
+Decided against a custom range filter: (1) it would catch nothing today; (2)
+NOAA's QC already runs a bounds check (q_flag = X), which staging already drops;
+(3) badly chosen limits would silently delete real extremes — and in a climate
+analysis extremes are signal, not noise.
+
+**Completeness rule for yearly aggregation (WMO-based)**
+Problem: a station-year with gaps produces a biased "yearly average" — e.g. a year
+missing all of winter averages fake-hot, faking a warming signal.
+
+Measured before deciding (TMAX, 1990–2025):
+  - 17,303 station-years exist (vs 491 x 36 = 17,676 — ~370 station-years have no
+    TMAX at all; invisible as rows).
+  - Under a simple "fewer than 300 days" test, 2,600 (15%) are thin — MORE common
+    in the analysis period than overall (11%), because station selection only
+    checked that records START by 1990 and END by 2025, never completeness in
+    between.
+  - Thin years spread: 318 at 290–299 days, 1,194 at 200–289, 729 at 100–199,
+    359 under 100.
+
+Why not a total-days threshold: two years with 250 days can differ completely —
+gaps scattered across the year (average roughly fine) vs. one whole season
+missing (average biased). A day count can't tell them apart; checking coverage
+per MONTH can.
+
+Why not a per-station rule (keep stations with a good AVERAGE of days/year): a
+station with 35 full years and one 40-day summer-only year averages ~356 days and
+passes, yet that one year shows a fake spike in its trend. The problem is a
+specific year, not the station — so the rule applies per station-year: drop the
+bad year, keep the station's good years.
+
+Rule adopted (domain standard, WMO "3/5 rule" — simpler half first):
+  1. A month is valid if it is missing at most 5 days
+     (days_in_month - observed_days <= 5).
+  2. A year is valid only if all 12 months are valid. A month with zero data has
+     no rows at all, so it never counts toward the 12 — the rule catches it
+     automatically.
+  3. The yearly value will be the average of the 12 monthly averages, so every
+     month weighs equally.
+  4. The current, unfinished year is always excluded (it is partial by
+     definition, even with daily refresh).
+
+Impact: ~70–75% of station-years pass (about 320–370 valid of ~470–487 each
+year). Accepted: ~340 valid stations per year is ample for a trend, the rule is
+defensible as the WMO standard, and fewer trustworthy values beat more biased
+ones. The pass rate is steady across years — no decade disproportionately cut —
+so the rule doesn't itself shift the trend.
+
+Where: this needs grouping (station/year/month), so it belongs in the marts layer,
+not staging (staging works row by row). Built and measured today as an ad-hoc
+query (CTEs: per station-month counts -> per station-year valid months -> totals);
+not yet a dbt model.
+
+Source for the WMO rule: Utah Climate Center, Calculation of Normals
+(climate.usu.edu/help/normals.php).
+
 ---
 
 ## Open / undecided (current)
 
-**Data quality / cleaning (not yet designed — next big staging decision)**
-raw is deliberately unfiltered, so staging has to decide what "clean" means.
-Known things to handle:
+**Data quality / cleaning**
   - q_flag: DONE 2026-10-11 — flagged values dropped in stg_observations.
-  - Missing-value sentinels: GHCN uses -9999 for missing in some distributions.
-    Confirm whether the by_station CSVs contain them and strip if so, or a single
-    bad row poisons any average.
-  - Physically implausible values (e.g. TMAX of 60C, negative PRCP) that pass QC
-    but shouldn't enter a trend.
-  - Partial years / sparse stations: a station-year with only a handful of days
-    shouldn't be averaged as if it were a full year. Decide a minimum-coverage
-    threshold before yearly aggregation.
-  - Elements beyond TMAX/PRCP are present in raw; marts should select explicitly
-    rather than aggregate whatever is there.
-Decide these as staging/marts rules, documented here, before the trend numbers
-mean anything.
+  - Missing-value sentinels: DONE 2026-10-17 — verified none exist.
+  - Implausible values: DONE 2026-10-17 — no custom filter; NOAA QC covers it.
+  - Completeness: DECIDED 2026-10-17 (WMO month rule) — implement as a mart model.
+  - WMO "no more than 3 CONSECUTIVE missing days" — the other half of the 3/5 rule.
+    Deferred: needs gap detection (runs of missing dates). Add after measuring the
+    simpler rule in practice.
+  - PRCP completeness: precipitation TOTALS allow NO missing days (a missing day
+    may be a missing storm). Needs its own rule — the TMAX rule doesn't transfer.
+  - 2005 anomaly: only 421 station-years have TMAX in 2005 vs ~485 around it
+    (~60 stations missing the entire year). Investigate.
+  - Elements beyond TMAX/PRCP are present; marts must select explicitly.
 
 - Change-detection skip strategy (file-level hash vs. always-pull window;
   Last-Modified already noted as weak).
@@ -679,8 +748,9 @@ mean anything.
 - dbt test to catch roster/data gaps loudly (e.g. no station marked success in the
   manifest with zero rows). Must run AFTER the observations load, or a legitimately
   new station would false-alarm.
-- Next phase: marts layer — pivot long->wide (TMAX/PRCP as columns), aggregate by
-  year, compute the warming trend.
+- NEXT: first mart model — turn the completeness query into a dbt model
+  (monthly -> valid years -> yearly average of monthly means), then pivot TMAX/PRCP
+  and compute the warming trend.
 
 ## Resolved (was open, now done)
 - Full backfill: all 491 loaded — DONE (2026-08-27, 52.5M rows).
@@ -703,3 +773,8 @@ mean anything.
 - Orphan observations removed from raw (28.7M rows, 245 stations) + stale manifest
   rows; all layers consistent at 491 — DONE (2026-10-11).
 - QC-flagged values (q_flag) dropped in staging, not per mart — DONE (2026-10-11).
+- Missing-value sentinels checked (none) and plausibility filter rejected (NOAA QC
+  suffices) — DONE (2026-10-17).
+- Completeness rule decided: month valid if <=5 days missing, year needs all 12
+  valid months, current year excluded — DECIDED (2026-10-17); implementation
+  pending as first mart.
