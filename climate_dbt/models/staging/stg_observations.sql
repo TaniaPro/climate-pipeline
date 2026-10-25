@@ -2,7 +2,10 @@ SELECT
     station_id,
     to_date(obs_date, 'YYYYMMDD')  AS obs_date,
     element,
-    value::integer                 AS value,
+    CASE
+        WHEN element IN ('TMAX', 'TMIN', 'PRCP') THEN value::integer / 10.0
+        ELSE value::integer
+    END                            AS value,
     NULLIF(m_flag, '')             AS m_flag,
     NULLIF(q_flag, '')             AS q_flag,
     NULLIF(s_flag, '')             AS s_flag,
