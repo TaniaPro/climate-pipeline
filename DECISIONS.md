@@ -713,9 +713,164 @@ Where: this needs grouping (station/year/month), so it belongs in the marts laye
 not staging (staging works row by row). Built and measured today as an ad-hoc
 query (CTEs: per station-month counts -> per station-year valid months -> totals);
 not yet a dbt model.
+UPDATED 2026-10-25: implemented as dbt models — two intermediate steps plus one
+mart (see 2026-10-25).
 
 Source for the WMO rule: Utah Climate Center, Calculation of Normals
 (climate.usu.edu/help/normals.php).
+
+## 2026-10-25
+
+**dbt layering: staging -> intermediate -> marts, named by grain**
+Turned the completeness query into dbt models. Split it into one model per step
+instead of one big model, so each step can be checked on its own (a wrong count is
+traced to the step that produced it) and reused later (e.g. the monthly step for
+PRCP).
+
+Layers, following the dbt convention:
+  - staging/ (stg_): 1:1 with the source, row-level cleaning only (casts, renames,
+    filters, unit conversion). No GROUP BY.
+  - intermediate/ (int_): middle steps, not queried directly.
+  - marts/ (fct_ / dim_): final tables people query. fct_ = measurements,
+    dim_ = descriptive entities (e.g. stations).
+Aggregation is business logic, so it starts in intermediate, never in staging.
+
+Models are named by their GRAIN — the columns that make a row unique:
+  - int_station_monthly: one row = station + month
+  - int_station_yearly_validity: one row = station + year
+  - fct_station_yearly: one row = station + year, valid years only
+Pipeline:
+  stg_observations -> int_station_monthly -> int_station_yearly_validity
+  -> fct_station_yearly
+
+**Unit conversion in staging (tenths -> real units)**
+GHCN stores TMAX/TMIN in tenths of a degree C and PRCP in tenths of a mm; SNOW and
+SNWD are in whole mm. The first monthly averages came out as ~323 — i.e. 32.3C.
+
+Decided: convert in stg_observations, so every downstream model gets real units
+and none has to REMEMBER to divide by 10 (same "fix it once upstream" reasoning as
+the q_flag filter). Implemented with CASE: TMAX/TMIN/PRCP divided by 10.0, other
+elements left as is — a blanket /10 would corrupt SNOW/SNWD.
+Trap: `value::integer / 10` is integer division in Postgres (323 / 10 = 32, the
+decimal is lost). Dividing by 10.0 makes the result numeric (32.3).
+After this change, `value` in stg_observations is in C (temperatures) and mm (PRCP).
+
+**int_station_monthly**
+TMAX only, 1990–2025. Per station-month: observed days, days_in_month,
+missing_days, and tmax_avg (monthly mean, rounded to 2 decimals). month is cast to
+date (date_trunc returns a timestamp).
+Trap: after adding ::date to month, `GROUP BY 1` grouped by
+date_trunc(...)::date while days_in_month used date_trunc(...) without the cast —
+Postgres treats those as different expressions and errors ("obs_date must appear
+in the GROUP BY clause"). Fixed by grouping on the expression itself,
+date_trunc('month', obs_date); both SELECT columns are built from it.
+
+Current-year cutoff: first written as a hard-coded `obs_date < '2026-01-01'`,
+which would exclude 2026 forever once 2027 arrives. Replaced with
+`obs_date < date_trunc('year', current_date)` — always "before January 1st of the
+year the model runs". Verified: fct_station_yearly still 12,012 rows (same result
+in 2026, as expected).
+
+**int_station_yearly_validity**
+Per station-year: valid_months (COUNT(*) FILTER (WHERE missing_days <= 5)) and the
+yearly tmax_avg = AVG of the monthly averages, so every month weighs equally
+regardless of its number of days observed.
+Put the yearly average here rather than JOINing the two intermediate models in
+the mart: both values share the same grain (station + year) and the same GROUP BY,
+so one model is simpler. Trade-off: the name now under-describes the model
+(int_station_yearly would fit) — rename left open.
+The average here also includes invalid months; that's harmless because the mart
+drops every year with fewer than 12 valid months.
+
+**fct_station_yearly — first mart**
+`SELECT year, station_id, tmax_avg ... WHERE valid_months = 12`. No GROUP BY (input
+is already one row per station-year) and no ORDER BY (a view doesn't keep order;
+whoever queries sorts).
+Result: 12,012 of 17,303 station-years (69.4%) — matches the ~70% pass rate
+measured on 2026-10-17, so the dbt implementation reproduces the ad-hoc analysis.
+
+**Tooling notes**
+  - The editor's SQL formatter rewrote `{{` as `{ {`, which breaks Jinja. Fix:
+    disable format-on-save for .sql, or use a dbt-aware extension.
+  - git push failed: GitHub doesn't accept passwords for git operations. Fix: the
+    GitHub CLI (`gh auth login`, HTTPS, browser login), which configures git's
+    credentials.
+
+## 2026-10-26
+
+**Warming measured as anomalies against a fixed 1991–2020 baseline**
+Looked up how the domain measures warming before building. Two standard tools:
+  1. Anomaly = a station's yearly value minus its own "normal" (its average over a
+     reference period). Needed because stations can't be averaged directly — a
+     34C Australian station and a 5C Canadian one would mix climate with location.
+     Anomalies put every station on the same scale ("+0.8 = 0.8C warmer than usual
+     for that station").
+  2. Trend = slope of a straight line through the anomalies, reported in C per
+     decade (how NOAA and the IPCC report it). Next step.
+
+Baseline: the fixed WMO standard period 1991–2020, not all available years.
+  - Stability: a baseline over "all years" changes every time a new year is
+    loaded, silently shifting every anomaly ever computed. A fixed period never
+    moves.
+  - Comparability: 1991–2020 is the official WMO normal, so results line up with
+    published figures.
+
+**A station's normal needs at least 24 of 30 baseline years (WMO 80% rule)**
+First measurement without a rule showed normals built from as little as 1 year —
+one unusually hot year would become that station's "normal". Adopted the WMO
+criterion: data for at least 80% of the years in the period (24 of 30), no extra
+consecutive-years criterion. Implemented with HAVING COUNT(*) >= 24 (HAVING, not
+WHERE — it filters groups, so it must come after GROUP BY).
+Known difference from WMO: WMO builds the annual normal from 12 monthly normals,
+not from yearly values. Ours averages complete years only (all 12 months valid),
+which gives nearly the same result and is simpler.
+Source: WMO Guidelines on the Calculation of Climate Normals (WMO-No. 1203),
+sec. 4.4.2.
+
+Result: 244 of 491 stations (50%) have a valid normal.
+
+**Coverage is uneven by country — investigated, accepted, reported per country**
+Stations with a valid normal: GM 71, SP 68, FR 40, AS 34, US 24, CA 5, JA 2.
+An all-station average would be ~75% Europe, and Japan/Canada have too few
+stations for a trustworthy trend.
+
+Investigated where Japan loses its stations before accepting it:
+  - The Japanese stations exist in fct_station_yearly but with only 1–21 valid
+    baseline years — so the cut happens at the MONTHLY completeness rule; the
+    24-year rule only finishes it.
+  - Example JA000047412: 1991–2013 months fail by just 6–8 missing days (one such
+    month discards the whole year); from Oct 2013 the TMAX record nearly stops
+    (1–2 observations per month).
+  - Ruled out a pipeline cause: TMAX rows for that station in 2014 = 5 in raw and
+    5 in stg_observations. Nothing is lost in loading or staging — NOAA's file is
+    thin at the source.
+
+Options considered:
+  1. Accept, report trends per country, state the coverage gap openly — CHOSEN.
+  2. Relax the rules for thin countries — rejected: breaks the WMO standard just
+     adopted and makes countries incomparable.
+  3. Rebuild the roster with completeness in mind (selection only checked that
+     records start by 1990 and end by 2025, never the gaps between) — deferred:
+     means changing the frozen roster and reloading.
+
+**int_station_normals and fct_station_anomalies**
+  - int_station_normals: one row per station — normal_temp (rounded to 2 dp),
+    baseline_years. 1991–2020, HAVING >= 24. Reads from fct_station_yearly.
+  - fct_station_anomalies: one row per station-year — station_id, year, tmax_avg,
+    normal_temp, anomaly = tmax_avg - normal_temp. INNER JOIN on station_id only
+    (normals have no year; every year of a station uses the same normal). INNER
+    because a station without a normal can't have an anomaly. Columns listed
+    explicitly instead of fsy.* so an upstream column change can't silently
+    alter the mart.
+  - Sanity check: mean anomaly over 1991–2020 = -0.0001 — ~0 by construction
+    (each station is measured against its own 1991–2020 average); the residue is
+    from rounding normals to 2 dp. Confirms the join and the math.
+
+**Tooling notes**
+  - Formatter kept rewriting `{{` as `{ {`. Fix: VS Code user settings,
+    "[sql]": { "editor.formatOnSave": false }.
+  - psql only runs a statement at `;` — typing `q` at a `-#` prompt just adds to
+    the unfinished buffer. Clear with `\r`.
 
 ---
 
@@ -725,7 +880,10 @@ Source for the WMO rule: Utah Climate Center, Calculation of Normals
   - q_flag: DONE 2026-10-11 — flagged values dropped in stg_observations.
   - Missing-value sentinels: DONE 2026-10-17 — verified none exist.
   - Implausible values: DONE 2026-10-17 — no custom filter; NOAA QC covers it.
-  - Completeness: DECIDED 2026-10-17 (WMO month rule) — implement as a mart model.
+  - Completeness: DONE 2026-10-25 — WMO month rule implemented
+    (int_station_monthly -> int_station_yearly_validity -> fct_station_yearly).
+  - Rounding: monthly averages are rounded to 2 decimals before the yearly
+    average. Tiny effect, but cleaner to round only in the final output.
   - WMO "no more than 3 CONSECUTIVE missing days" — the other half of the 3/5 rule.
     Deferred: needs gap detection (runs of missing dates). Add after measuring the
     simpler rule in practice.
@@ -748,9 +906,23 @@ Source for the WMO rule: Utah Climate Center, Calculation of Normals
 - dbt test to catch roster/data gaps loudly (e.g. no station marked success in the
   manifest with zero rows). Must run AFTER the observations load, or a legitimately
   new station would false-alarm.
-- NEXT: first mart model — turn the completeness query into a dbt model
-  (monthly -> valid years -> yearly average of monthly means), then pivot TMAX/PRCP
-  and compute the warming trend.
+- Rename int_station_yearly_validity -> int_station_yearly (it now also holds the
+  yearly average).
+- BI / dashboard layer. Options: Metabase (local, Docker, connects to Postgres
+  directly — not shareable); Tableau Public (public link, but no live connection to
+  local Postgres — needs a CSV export of the mart); Evidence (SQL + Markdown in the
+  repo, deployable to a public link). Power BI Desktop ruled out: Windows only.
+  Key question: does the portfolio need a public link, or are README screenshots
+  enough?
+- Layering: int_station_normals reads from a mart (fct_station_yearly). dbt
+  convention is that intermediate models don't depend on marts. Revisit (e.g.
+  move the valid-year filter into an intermediate model both can use).
+- Minimum number of stations per country before its trend is reported (JA 2 and
+  CA 5 are clearly too few) — threshold undecided.
+- Roster rebuild that checks completeness, not just start/end years (option 3 of
+  2026-10-26) — deferred.
+- NEXT: warming trend — slope of anomalies over years, in C per decade, per
+  country; then PRCP (needs its own completeness rule, see above).
 
 ## Resolved (was open, now done)
 - Full backfill: all 491 loaded — DONE (2026-08-27, 52.5M rows).
@@ -776,5 +948,15 @@ Source for the WMO rule: Utah Climate Center, Calculation of Normals
 - Missing-value sentinels checked (none) and plausibility filter rejected (NOAA QC
   suffices) — DONE (2026-10-17).
 - Completeness rule decided: month valid if <=5 days missing, year needs all 12
-  valid months, current year excluded — DECIDED (2026-10-17); implementation
-  pending as first mart.
+  valid months, current year excluded — DECIDED (2026-10-17); implemented as
+  first mart (2026-10-25).
+- Unit conversion (tenths -> C / mm) in staging — DONE (2026-10-25).
+- Current-year cutoff made dynamic (date_trunc('year', current_date)) instead of
+  hard-coded — DONE (2026-10-25).
+- Station normals (1991–2020, WMO >= 24 of 30 years) — DONE (2026-10-26),
+  244 stations.
+- Anomalies mart fct_station_anomalies — DONE (2026-10-26), mean ~0 over baseline.
+- Country coverage gap investigated: source data, not pipeline; decided to report
+  per country — DONE (2026-10-26).
+- First mart fct_station_yearly built via two intermediate models; 12,012 valid
+  station-years (69.4%) — DONE (2026-10-25).

@@ -12,7 +12,7 @@ FROM (
         FROM {{ ref('stg_observations') }}
         WHERE element = 'TMAX'
             AND obs_date >= '1990-01-01'
-            AND obs_date < '2026-01-01'
+            AND obs_date < date_trunc('year',current_date)
         GROUP BY date_trunc('month', obs_date),
             station_id
     ) t
