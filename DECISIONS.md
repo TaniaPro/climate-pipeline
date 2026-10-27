@@ -944,6 +944,57 @@ Result: SELECT * FROM fct_country_trends went to 0.64 s. The rest stays views.
 Refresh is then an orchestration concern: ingestion -> dbt run -> dbt test, in
 that order (Airflow later), so tables are never rebuilt from a half-loaded raw.
 
+**Dashboard plan: three charts, three messages**
+Decided what a viewer should understand in 30 seconds before opening Tableau:
+  1. "All countries are warming" — line chart: year vs average anomaly, one line
+     per country.
+  2. "Which country warms fastest" — bar chart of slope_c_per_decade.
+  3. "Where data is missing" — CA and JA shown greyed with "insufficient
+     stations" (from is_reportable).
+Started with chart 1.
+
+**fct_country_yearly_anomalies — the country-year series as its own model**
+The line chart needs one row per country + year. That data existed only as a
+CTE inside fct_country_trends, and a CTE can't be exported.
+Rejected exporting fct_station_anomalies and letting Tableau average it: the
+chart's numbers would then be defined in Tableau while the slopes come from dbt
+— two definitions of the same data that can drift apart (Tableau also defaults
+to SUM, not AVG). Same principle as "metrics live in dbt".
+Done: the CTE became fct_country_yearly_anomalies (country, year as integer,
+avg_anomaly, station_count). fct_country_trends now reads from it instead of
+keeping its own copy:
+  fct_station_anomalies -> fct_country_yearly_anomalies -> fct_country_trends
+avg_anomaly is NOT rounded here, because the slope is computed from it
+(rounding before a calculation is the open "rounding too early" issue); the
+dashboard rounds for display. Year cast ::integer so Tableau doesn't show
+"2,016.00". Verified: slopes after the refactor are identical to before.
+
+**CSV export for Tableau, kept out of Git**
+Tableau Public can't connect to the local Postgres, so the marts go in as CSV:
+  \copy (SELECT * FROM analytics.fct_country_yearly_anomalies)
+    TO 'dashboard/data/country_yearly_anomalies.csv' WITH CSV HEADER
+\copy writes on the client machine; the path is relative to where psql started
+(run from the repo root). Files go to a dedicated dashboard/data/ folder.
+dashboard/data/ is in .gitignore: the CSVs are generated and recreatable with one
+command, so Git keeps the code that makes them (dbt models + export command), not
+the outputs — generated files go stale and clutter history.
+Loaded into Tableau Public: 245 rows (5 countries x 36 years + CA 35 + JA 30).
+
+**Country codes are FIPS, not ISO — real names needed before charting**
+Tableau auto-assigned the country column a geographic role, assuming ISO codes.
+GHCN uses FIPS codes, which differ: in ISO, AS = American Samoa (not
+Australia), GM = Gambia (not Germany), and JA / SP aren't valid codes at all. Left
+as is, any map would place "Germany" in Africa.
+Decided to fix it in the data, not patch it in Tableau (switching the role off
+would only hide the problem for this one workbook).
+Source: NOAA's ghcnd-countries.txt in the same bucket — "AS Australia": code in
+the first 2 characters, a space, then the name. Some names have trailing spaces
+(need strip) and some contain commas ("Bahamas, The").
+Options: (1) ingest it like ghcnd-stations.txt (Python download -> raw table ->
+stg_countries); (2) a dbt seed (small CSV in the repo, loaded by `dbt seed`,
+could also carry ISO codes). CHOSE (1): same pattern as stations, and the names
+come from NOAA's own file rather than a hand-maintained one.
+
 ---
 
 ## Open / undecided (current)
@@ -986,7 +1037,7 @@ that order (Airflow later), so tables are never rebuilt from a half-loaded raw.
   repo, deployable to a public link). Power BI Desktop ruled out: Windows only.
   Key question: does the portfolio need a public link, or are README screenshots
   enough?
-  UPDATED 2026-10-27: leaning Tableau Public — runs on Mac, gives a public link a
+  UPDATED 2026-10-27: Tableau Public (installed; chart 1 data loaded) — runs on Mac, gives a public link a
   reviewer can open, common in job postings, already studied it. Data goes in as
   a CSV export of the marts (no direct database connection). A paid
   certification judged unnecessary for a Data Engineer target; the dashboard on
@@ -1001,8 +1052,10 @@ that order (Airflow later), so tables are never rebuilt from a half-loaded raw.
   whether a fixed station set changes the slopes.
 - Roster rebuild that checks completeness, not just start/end years (option 3 of
   2026-10-26) — deferred.
-- NEXT: dashboard — export the marts (country-year anomalies + fct_country_trends)
-  and build it in Tableau Public; then PRCP (needs its own completeness rule).
+- Countries ingestion: load all countries or only the 7 in the roster — undecided.
+- NEXT: ingest ghcnd-countries.txt (parse code [0:2] + name, strip) -> raw table
+  -> stg_countries -> join country names into the marts -> re-export CSVs ->
+  Tableau chart 1 (line chart); then charts 2 and 3; then PRCP.
 
 ## Resolved (was open, now done)
 - Full backfill: all 491 loaded — DONE (2026-08-27, 52.5M rows).
@@ -1043,5 +1096,9 @@ that order (Airflow later), so tables are never rebuilt from a half-loaded raw.
   (2026-10-27).
 - int_station_monthly materialized as a table; marts queries ~0.6 s — DONE
   (2026-10-27).
+- Country-year series split into fct_country_yearly_anomalies; fct_country_trends
+  reads from it — DONE (2026-10-27).
+- Dashboard tool: Tableau Public; CSV export to dashboard/data/ (gitignored) —
+  DONE (2026-10-27).
 - First mart fct_station_yearly built via two intermediate models; 12,012 valid
   station-years (69.4%) — DONE (2026-10-25).
