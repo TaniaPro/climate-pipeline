@@ -1,3 +1,5 @@
+{{ config(materialized='table') }}
+
 SELECT t.*,
     days_in_month - monthly_observations AS missing_days
 FROM (

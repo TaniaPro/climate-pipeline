@@ -872,6 +872,78 @@ Options considered:
   - psql only runs a statement at `;` — typing `q` at a `-#` prompt just adds to
     the unfinished buffer. Clear with `\r`.
 
+## 2026-10-27
+
+**Warming trend = slope of the yearly country anomaly, in C per decade**
+Two levels of aggregation, because a slope needs many points:
+  1. Per country per year: average anomaly of that country's stations (also the
+     series a dashboard will chart).
+  2. Per country: regr_slope(avg_anomaly, year) over those ~36 yearly points
+     (least-squares straight line), x 10 to turn C/year into C/decade.
+Postgres can't nest one aggregate inside another in the same query, so step 1
+is a CTE. The year must be a number for regr_slope: EXTRACT(year FROM year).
+
+Why a slope and not a comparison of two years: year-to-year noise is +-1-2C
+(Germany: 1996 and 2010 cold, 2014-15 record warm). Picking endpoints gives any
+answer you want — 1996 vs 2014 looks like +3.4C, 1990 vs 2013 looks like cooling.
+A fitted line uses every year and isn't driven by one extreme.
+
+Result, TMAX 1990–2025 (C per decade): GM +0.56, FR +0.51, SP +0.47, AS +0.38,
+US +0.16; CA +0.41 and JA +0.24 shown but not reportable (see below). Germany
++0.56/decade over 3.6 decades is ~+2C since 1990. Europe leading is consistent
+with WMO/Copernicus reporting Europe as the fastest-warming continent.
+Caveat when presenting: these are daily HIGHS (TMAX); published figures usually
+use mean temperature, so they won't match exactly.
+
+**A country's trend is reportable only with >= 10 stations — flagged, not
+filtered**
+Looked for a domain standard: there isn't one (no WMO-style rule like the 24/30
+years). The literature instead says sampling error falls roughly with 1/N, that
+spatial coverage matters as much as count (professional datasets grid and
+area-weight stations), and that trends are reported with an uncertainty range
+rather than a station cutoff.
+Chose a simple cutoff anyway: stations with a valid normal are GM 71, SP 68,
+FR 40, AS 34, US 24 | CA 5, JA 2 — a large natural gap between 24 and 5. Any
+cutoff from 6 to 24 gives the identical result, so the exact value doesn't drive
+the outcome; 10 sits clearly inside the gap. Showing an uncertainty range per
+slope (the domain's way) is left open.
+Flag vs filter: kept all 7 countries with is_reportable instead of dropping CA
+and JA. Filtering would make them silently disappear; the flag lets the
+dashboard state "Japan: insufficient data (2 stations)" — which is what the
+2026-10-26 decision ("state the coverage gap openly") requires. It also keeps
+the threshold changeable without losing rows.
+
+**fct_country_trends (mart)**
+One row per country: slope_c_per_decade, avg_stations (average per year), years,
+station_dist_count, is_reportable.
+  - CTE country_year: country + year -> avg anomaly (the slope input).
+  - CTE stations_per_country: country -> COUNT(DISTINCT station_id). Needed as a
+    separate CTE because country_year is already split by year, so it can't count
+    stations across years; DISTINCT so a station isn't counted once per year.
+  - JOIN on country; station_dist_count goes into the GROUP BY (one value per
+    country, but Postgres still requires it).
+Verified: slopes match the ad-hoc query; station counts match int_station_normals.
+
+**Metrics live in dbt, not in the BI tool**
+Tableau could compute slopes itself. Kept the logic in dbt: (1) one source of
+truth — the slope and the >= 10 rule are definitions, versioned and reviewable in
+Git, not hidden in a workbook that can't be diffed; (2) every consumer gets the
+same numbers; (3) the dashboard stays a thin display layer. Tableau's own trend
+line is fine as a visual; the reported numbers come from the model.
+
+**Materialization: int_station_monthly as a table**
+Querying the marts had become slow enough to look hung: every model was a view,
+so each query recomputed the whole chain from ~26M staging rows.
+View = stored query, computed at every read (always fresh, slow). Table = result
+computed once at `dbt run` and stored (fast reads, a snapshot until the next
+run). Snapshot is fine here: the pipeline already loads then rebuilds.
+Only one model needed to change: int_station_monthly is where 26M rows collapse
+to ~200k (about 130x). As a table, everything downstream starts from ~200k ready
+rows. Set with {{ config(materialized='table') }} at the top of the model.
+Result: SELECT * FROM fct_country_trends went to 0.64 s. The rest stays views.
+Refresh is then an orchestration concern: ingestion -> dbt run -> dbt test, in
+that order (Airflow later), so tables are never rebuilt from a half-loaded raw.
+
 ---
 
 ## Open / undecided (current)
@@ -901,8 +973,8 @@ Options considered:
   levels, log-to-file; partly handled by Airflow later).
 - Guard: download_station_inventory can return None on a failed fetch;
   select_stations would then crash on "for line in lines". Add a guard.
-- Materialization: stg_observations is a view over 52M rows. Consider switching to
-  table if marts queries get slow.
+- Materialization: int_station_monthly is a table since 2026-10-27; the rest are
+  views. Revisit if marts get slow again (e.g. marts as tables for the dashboard).
 - dbt test to catch roster/data gaps loudly (e.g. no station marked success in the
   manifest with zero rows). Must run AFTER the observations load, or a legitimately
   new station would false-alarm.
@@ -914,15 +986,23 @@ Options considered:
   repo, deployable to a public link). Power BI Desktop ruled out: Windows only.
   Key question: does the portfolio need a public link, or are README screenshots
   enough?
+  UPDATED 2026-10-27: leaning Tableau Public — runs on Mac, gives a public link a
+  reviewer can open, common in job postings, already studied it. Data goes in as
+  a CSV export of the marts (no direct database connection). A paid
+  certification judged unnecessary for a Data Engineer target; the dashboard on
+  top of the dbt marts is the stronger evidence.
 - Layering: int_station_normals reads from a mart (fct_station_yearly). dbt
   convention is that intermediate models don't depend on marts. Revisit (e.g.
   move the valid-year filter into an intermediate model both can use).
-- Minimum number of stations per country before its trend is reported (JA 2 and
-  CA 5 are clearly too few) — threshold undecided.
+- Uncertainty per trend (standard error / confidence range of the slope) — the
+  domain's way to show reliability; complements the >= 10 cutoff.
+- Country-year averages use whichever stations are valid that year, so the
+  station set varies slightly year to year. Anomalies limit the effect; check
+  whether a fixed station set changes the slopes.
 - Roster rebuild that checks completeness, not just start/end years (option 3 of
   2026-10-26) — deferred.
-- NEXT: warming trend — slope of anomalies over years, in C per decade, per
-  country; then PRCP (needs its own completeness rule, see above).
+- NEXT: dashboard — export the marts (country-year anomalies + fct_country_trends)
+  and build it in Tableau Public; then PRCP (needs its own completeness rule).
 
 ## Resolved (was open, now done)
 - Full backfill: all 491 loaded — DONE (2026-08-27, 52.5M rows).
@@ -958,5 +1038,10 @@ Options considered:
 - Anomalies mart fct_station_anomalies — DONE (2026-10-26), mean ~0 over baseline.
 - Country coverage gap investigated: source data, not pipeline; decided to report
   per country — DONE (2026-10-26).
+- Warming trend mart fct_country_trends (C/decade per country) — DONE (2026-10-27).
+- Minimum stations per country: >= 10, flagged via is_reportable — DECIDED
+  (2026-10-27).
+- int_station_monthly materialized as a table; marts queries ~0.6 s — DONE
+  (2026-10-27).
 - First mart fct_station_yearly built via two intermediate models; 12,012 valid
   station-years (69.4%) — DONE (2026-10-25).
