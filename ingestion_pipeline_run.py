@@ -1,5 +1,6 @@
 from fetch_observations import select_stations, download_station, parse_station, load_observations
 from fetch_stations import parse_stations_meta_data, load_station_metadata
+from fetch_countries import parse_countries_meta_data, load_countries_metadata
 from record_manifest import record_manifest, is_loaded, get_roster
 
 
@@ -31,3 +32,8 @@ def run_stations_pipeline():
     rows = parse_stations_meta_data()
     load_station_metadata(rows)
     print(f"loaded {len(rows)} stations")
+
+def run_countries_pipeline():
+    rows = parse_countries_meta_data()
+    load_countries_metadata(rows)
+    print(f"loaded {len(rows)} countries")

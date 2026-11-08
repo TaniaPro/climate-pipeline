@@ -6,3 +6,4 @@ sources:
     tables:
       - name: observations
       - name: stations
+      - name: countries

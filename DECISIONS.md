@@ -995,6 +995,86 @@ stg_countries); (2) a dbt seed (small CSV in the repo, loaded by `dbt seed`,
 could also carry ISO codes). CHOSE (1): same pattern as stations, and the names
 come from NOAA's own file rather than a hand-maintained one.
 
+## 2026-10-29
+
+**Country names: ingest NOAA's ghcnd-countries.txt, all 219 countries**
+Why: the marts carried FIPS codes, and Tableau read them as ISO (GM = Gambia,
+AS = American Samoa). Fixed in the data rather than in Tableau (see 2026-10-27).
+Load ALL countries, not only the 7 in the roster:
+  - it's a lookup table, not analysed data — 219 rows cost nothing, and the dbt
+    join picks only the codes it needs;
+  - filtering to the roster would couple it to the roster: add a country and you'd
+    have to REMEMBER to reload countries — the same remember-to-do-X pattern that
+    caused the roster drift. raw.stations is filtered because it IS the roster;
+    countries aren't.
+
+**raw.countries + fetch_countries.py**
+Table: raw.countries (fips_code text PRIMARY KEY, country_name text).
+  - Named fips_code, not code, so the FIPS-vs-ISO trap stays visible in the schema.
+  - text, not VARCHAR(2): raw accepts whatever the source sends (a 3-char code
+    would load instead of failing) and staging decides; consistent with the other
+    raw tables. The PK also makes fips_code NOT NULL and enables the upsert.
+fetch_countries.py — same 3-step pattern as fetch_stations.py:
+  1. download_countries_meta_data(): GET ghcnd-countries.txt, splitlines.
+  2. parse_countries_meta_data(): code = line[0:2]; name = line[3:].strip()
+     (index 2 is the separating space; names have trailing spaces). `if line:`
+     skips empty lines, which would otherwise insert a ('', '') country. No roster
+     filter.
+  3. load_countries_metadata(rows): execute_values upsert,
+     ON CONFLICT (fips_code) DO UPDATE SET country_name = EXCLUDED.country_name.
+     EXCLUDED = the row that was blocked by the conflict, so a re-run updates a
+     renamed country instead of erroring or duplicating — idempotent.
+Wired in as run_countries_pipeline() in ingestion_pipeline_run.py.
+Verified: 219 countries loaded; AS = Australia, GM = Germany, JA = Japan,
+SP = Spain.
+
+**stg_countries and country names in the marts**
+stg_countries: pass-through of raw.countries (raw is already clean); countries
+added to _sources.yml.
+Joined once, in fct_country_yearly_anomalies; fct_country_trends inherits the
+names because it reads from that model.
+Kept BOTH country_code (for joins) and country_name (for display). Replacing the
+code with the name would have broken fct_country_trends: its station-count CTE
+still produces FIPS codes, and GM != Germany would join to 0 rows. country_name
+also had to go into GROUP BY (Postgres rejects a selected column that isn't
+grouped).
+Verified: all 7 countries matched (an inner join would have dropped any
+unmatched code) and the slopes are unchanged.
+
+**CSV export runs through psql -c**
+`\copy` is a psql command, not a shell one — typed straight into zsh it fails
+("number expected"). Run from the repo root as:
+  psql climate -c "\copy (SELECT * FROM analytics.fct_country_trends) TO
+    'dashboard/data/country_trends.csv' WITH CSV HEADER"
+Exported country_yearly_anomalies.csv (245 rows) and country_trends.csv (7 rows,
+for chart 2).
+
+**Chart 1: "Every country's daily highs are rising" — small multiples + trends**
+How it got there:
+  - SUM trap: Tableau aggregates measures by default. With no country split,
+    SUM(avg_anomaly) added the 7 countries together (axis -6..+4 — meaningless).
+    Putting country_name on Color gave one line per country; each line has one
+    row per year, so SUM of one value = the value.
+  - Spaghetti: 7 noisy overlapping lines hid the message. Added linear trend lines
+    (Analytics -> Trend Line). Tableau's linear trend is the same least-squares
+    fit as regr_slope, so the visual matches the dbt numbers.
+  - Still unreadable, so small multiples: country_name moved to Rows, one panel
+    per country, nothing overlaps.
+  - Readable for a viewer, not just for me: the title states the conclusion; a
+    subtitle explains how to read it ("0 = each country's 1991–2020 average. Above
+    0 = warmer than usual. Dashed line = trend"); y-axis renamed "°C vs normal";
+    Fit = Entire View so no panel needs scrolling.
+  - Canada and Japan removed from this chart (not reportable: 5 and 2 stations).
+    To keep the 2026-10-26 "state the gap openly" decision, the exclusion should
+    be stated on the chart itself (see Open).
+
+**Tableau workbook in the repo**
+Saved locally as tableau/climate_dashboard.twb (renamed from Book1.twb on
+2026-11-08). The .twb is the dashboard's definition (XML, no data), so it is
+versioned like code; the CSVs it reads stay gitignored as generated outputs.
+*.twbr added to .gitignore — a temporary lock file Tableau creates while a
+workbook is open.
+
 ---
 
 ## Open / undecided (current)
@@ -1052,10 +1132,16 @@ come from NOAA's own file rather than a hand-maintained one.
   whether a fixed station set changes the slopes.
 - Roster rebuild that checks completeness, not just start/end years (option 3 of
   2026-10-26) — deferred.
-- Countries ingestion: load all countries or only the 7 in the roster — undecided.
-- NEXT: ingest ghcnd-countries.txt (parse code [0:2] + name, strip) -> raw table
-  -> stg_countries -> join country names into the marts -> re-export CSVs ->
-  Tableau chart 1 (line chart); then charts 2 and 3; then PRCP.
+- Chart 1: CA/JA are excluded by a manual filter in Tableau, not driven by
+  is_reportable — if the roster or the cutoff changes, the chart won't follow.
+  Consider adding is_reportable to fct_country_yearly_anomalies and filtering on it.
+- download_countries_meta_data can return None on a failed fetch; parse would
+  crash on "for line in lines" (same gap as select_stations above).
+- NEXT: finish chart 1 (subtitle line "Canada and Japan not shown: too few
+  stations for a reliable trend"; x-axis fixed 1990–2025; hide the country_name
+  field label) -> chart 2 (bar chart of slope_c_per_decade) -> chart 3 (data
+  coverage) -> publish to Tableau Public -> README with architecture diagram and
+  dbt lineage graph; then PRCP.
 
 ## Resolved (was open, now done)
 - Full backfill: all 491 loaded — DONE (2026-08-27, 52.5M rows).
@@ -1100,5 +1186,9 @@ come from NOAA's own file rather than a hand-maintained one.
   reads from it — DONE (2026-10-27).
 - Dashboard tool: Tableau Public; CSV export to dashboard/data/ (gitignored) —
   DONE (2026-10-27).
+- Country names: raw.countries (all 219) + stg_countries, names joined into the
+  marts alongside the FIPS code — DONE (2026-10-29).
+- Chart 1 (small multiples with trend lines) built and saved as
+  tableau/climate_dashboard.twb — DONE (2026-10-29).
 - First mart fct_station_yearly built via two intermediate models; 12,012 valid
   station-years (69.4%) — DONE (2026-10-25).
