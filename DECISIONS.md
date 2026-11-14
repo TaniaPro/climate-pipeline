@@ -1075,6 +1075,105 @@ versioned like code; the CSVs it reads stay gitignored as generated outputs.
 *.twbr added to .gitignore — a temporary lock file Tableau creates while a
 workbook is open.
 
+## 2026-11-08
+
+**Chart 1 finished**
+Added the footnote "* Canada and Japan not shown: too few stations for a
+reliable trend" (keeps the 2026-10-26 "state the gap openly" decision on the
+chart itself), fixed the x-axis to 1990–2025, hid the country_name field label.
+Workbook renamed Book1.twb -> tableau/climate_dashboard.twb.
+
+**Daily mode for observations: re-download everything, write only the last 90 days**
+Problem found while designing the Airflow schedule: run_observations_pipeline
+skips every station already marked 'success' in the manifest. After the backfill
+that is all 491, so a scheduled run would show green and load NOTHING — new days
+from NOAA would never arrive. The manifest was built for resuming a backfill, not
+for refreshing.
+What can't be avoided: the by_station file always holds a station's full history,
+so a refresh must download the whole file again (there is no "new days only"
+file). What can be controlled: what gets WRITTEN. Re-upserting ~52M rows daily
+would be slow and leave a dead row per DO UPDATE (MVCC).
+Decision — a trailing window:
+  - WINDOW_DAYS = 90 (constant at the top of fetch_observations.py, with its
+    reason): NOAA revises values 45–60 days after a month ends, 90 covers it.
+  - The filter lives in SQL, not Python: COPY the whole file into the temp
+    staging table (cheap), then the INSERT ... SELECT gets
+    WHERE to_date(obs_date,'YYYYMMDD') >= current_date - interval '90 days'.
+    SQL does date math natively; in Python it would mean parsing every line.
+  - load_observations(text, daily=False): Python builds the WHERE as a string
+    (empty for backfill) and inserts it into ONE query via an f-string. A first
+    version duplicated the whole upsert in an if/else — rejected: any later
+    change to the upsert would have to be made twice (remember-to-do-X again).
+    (It also had the two branches swapped: daily got no filter, backfill got it.)
+    `daily` itself never reaches Postgres — it only decides which SQL text is sent.
+  - run_observations_pipeline(daily=False):
+      * the is_loaded skip applies only to backfill;
+      * daily passes daily=True to the loader;
+      * "0 rows = failed" applies only to backfill (a whole history can't be
+        empty). In daily mode 0 rows is legitimate — a station with no reports
+        in the last 90 days (e.g. the Japanese stations whose TMAX record
+        stopped in 2013). Marking it failed would be a daily false alarm.
+  - Side effect, accepted: in daily mode the manifest's row_count is overwritten
+    with the daily count, so it means "last run", not "backfill size".
+Verified on GM000010147: daily load = 208 rows; run again = 208 again, and the
+table count for that station's last 90 days stayed 208 (not 416) — idempotent.
+
+## 2026-11-14
+
+**Airflow: own venv, local standalone**
+  - Installed Airflow 3.3.2 in its OWN venv (~/airflow-venv), not the project
+    .venv. Airflow pins hundreds of package versions; mixing it with dbt in one
+    environment is a common source of conflicts. Installed with Airflow's
+    constraints file (its tested list of exact versions) for Python 3.11.
+  - `airflow standalone` for local use: sets up Airflow's metadata DB, creates
+    the admin user, runs all components. AIRFLOW_HOME = ~/airflow (config, DB,
+    logs) — outside the repo.
+  - Airflow is a server, not a script: it runs until stopped (Ctrl+C); the
+    dag-processor scans the DAG folder every few seconds, runs each file, and
+    saves the DAG's structure to Airflow's DB; the UI only reads that DB.
+
+**The DAG lives in the repo (dags/), not in ~/airflow/dags**
+The DAG is the definition of how the pipeline runs — code, like the loaders. In
+~/airflow it would have no Git history, wouldn't be on GitHub, and would vanish
+with the laptop. Airflow is pointed at the repo folder via
+AIRFLOW__CORE__DAGS_FOLDER (any setting can be overridden with an
+AIRFLOW__<SECTION>__<KEY> environment variable); example DAGs turned off with
+AIRFLOW__CORE__LOAD_EXAMPLES=False.
+
+**DAG climate_daily: load_observations >> dbt_run >> dbt_test**
+What goes on the daily list — and what doesn't:
+  - load_observations: run_observations_pipeline(daily=True).
+  - dbt_run: rebuilds the models; must come AFTER the load, or the
+    int_station_monthly table keeps yesterday's numbers.
+  - dbt_test: checks what was just built, so it comes after dbt_run.
+  - NOT daily: run_stations_pipeline. It calls select_stations(), which
+    recomputes the roster from NOAA's LIVE inventory — scheduling it would let
+    the 491 drift by itself, the exact problem the frozen roster prevents. The
+    daily load reads the frozen list via get_roster(). Stations stays a
+    deliberate, manual act (also needed to build the roster from scratch).
+  - NOT daily: run_countries_pipeline — names don't change.
+Each task is a BashOperator running the same command as by hand, calling the
+PROJECT venv's binaries directly (.venv/bin/python, ../.venv/bin/dbt) — Airflow's
+own venv doesn't have psycopg2 or dbt, and full paths avoid `source activate`.
+`&&` so the command doesn't run if the cd failed.
+schedule="@daily" (midnight UTC = 02:00 local), catchup=False (don't replay the
+days since start_date).
+
+**First runs — three bugs, three fixes**
+  1. Tasks ran in PARALLEL: dbt_run and dbt_test started the same second as the
+     load, so dbt rebuilt before the new data arrived. Cause: the saved file had
+     `task = BashOperator(...),` — a trailing comma after the call makes a tuple —
+     and no `>>` line, so Airflow saw 3 independent tasks. Fixed the commas and
+     added load_observations >> dbt_run >> dbt_test.
+  2. Two runs loading at once: switching the DAG on made Airflow create the
+     scheduled run that was due, while a manual run was also triggered — both
+     upserting the same rows (double work, possible lock waits/deadlocks). Fix:
+     max_active_runs=1, so a run waits for the previous one to finish.
+  3. No progress in the task log for minutes: Python buffers print output when
+     it isn't writing to a terminal and flushes it at exit. Fix: `python -u`
+     (unbuffered), so "loaded <station>: N rows (i/491)" streams live.
+Observed: ~1 station per second, so a full daily load takes ~9 minutes.
+
 ---
 
 ## Open / undecided (current)
@@ -1098,10 +1197,9 @@ workbook is open.
 
 - Change-detection skip strategy (file-level hash vs. always-pull window;
   Last-Modified already noted as weak).
-- Trailing-window incremental load (re-pull ~90 days + upsert) now that backfill
-  is done.
 - Switch print -> logging in run_observations_pipeline (prod-grade: timestamps,
-  levels, log-to-file; partly handled by Airflow later).
+  levels, log-to-file). UPDATED 2026-11-14: Airflow now captures stdout per task
+  with timestamps (python -u), which covers most of it.
 - Guard: download_station_inventory can return None on a failed fetch;
   select_stations would then crash on "for line in lines". Add a guard.
 - Materialization: int_station_monthly is a table since 2026-10-27; the rest are
@@ -1137,11 +1235,20 @@ workbook is open.
   Consider adding is_reportable to fct_country_yearly_anomalies and filtering on it.
 - download_countries_meta_data can return None on a failed fetch; parse would
   crash on "for line in lines" (same gap as select_stations above).
-- NEXT: finish chart 1 (subtitle line "Canada and Japan not shown: too few
-  stations for a reliable trend"; x-axis fixed 1990–2025; hide the country_name
-  field label) -> chart 2 (bar chart of slope_c_per_decade) -> chart 3 (data
-  coverage) -> publish to Tableau Public -> README with architecture diagram and
-  dbt lineage graph; then PRCP.
+- Airflow settings are only `export`ed in one terminal tab — closing it loses
+  DAGS_FOLDER and LOAD_EXAMPLES. Make them permanent (airflow.cfg or a start
+  script in the repo).
+- dbt_test currently runs 0 tests, so it always passes. Add real tests
+  (not_null / unique on keys, accepted range, anomalies average ~0 over
+  1991–2020, roster/data gaps — see above).
+- Manual "setup_reference" DAG (schedule=None: countries -> stations) so the
+  roster build is documented and one click away, never automatic.
+- Airflow runs only while the Mac is awake and `airflow standalone` is open — fine
+  for a local portfolio; a hosted/Docker setup is a later option.
+- First full scheduled run (load ~9 min -> dbt run -> dbt test): verify green.
+- NEXT: Airflow loose ends (permanent settings, dbt tests) -> chart 2 (bar chart
+  of slope_c_per_decade) -> chart 3 (data coverage) -> publish to Tableau Public
+  -> README with architecture diagram and dbt lineage graph; then PRCP.
 
 ## Resolved (was open, now done)
 - Full backfill: all 491 loaded — DONE (2026-08-27, 52.5M rows).
@@ -1190,5 +1297,10 @@ workbook is open.
   marts alongside the FIPS code — DONE (2026-10-29).
 - Chart 1 (small multiples with trend lines) built and saved as
   tableau/climate_dashboard.twb — DONE (2026-10-29).
+- Chart 1 finishing touches (exclusion footnote, fixed axis) — DONE (2026-11-08).
+- Trailing-window daily load (daily=True: re-download all, upsert last 90 days,
+  0 rows ok) — DONE (2026-11-08).
+- Airflow 3.3.2 installed (own venv); DAG climate_daily in the repo with
+  load_observations >> dbt_run >> dbt_test, max_active_runs=1 — DONE (2026-11-14).
 - First mart fct_station_yearly built via two intermediate models; 12,012 valid
   station-years (69.4%) — DONE (2026-10-25).
