@@ -3,6 +3,10 @@ import gzip
 import psycopg2
 import io
 
+# Daily mode re-loads only the most recent days. NOAA revises values for
+# 45–60 days after a month ends, so 90 days covers every revision.
+WINDOW_DAYS = 90
+
 # step 1: fetches inventory lines (all stations' coverage)
 def download_station_inventory():
     # ghcnd-inventory.txt lists which elements each station records and the
@@ -104,7 +108,7 @@ def parse_station(text, station_id):
 
 
 # step 5: bulk-load one station's parsed text into raw.observations via COPY
-def load_observations(text):
+def load_observations(text, daily=False):
     conn = psycopg2.connect(dbname="climate")
     cursor = conn.cursor()
 
@@ -127,13 +131,25 @@ def load_observations(text):
     # 3. upsert staging -> raw.observations. New rows insert; rows whose
     #    (station_id, obs_date, element) already exist get their values
     #    overwritten instead of duplicated.
-    cursor.execute("""
+    #    daily=False (backfill): load every row in the file.
+    #    daily=True: the file still holds the station's full history, so keep
+    #    only the last WINDOW_DAYS — avoids re-upserting the whole history
+    #    (and leaving a dead row per update) on every run.
+    where_clause = ""
+    if daily:
+        where_clause = (
+            "WHERE to_date(obs_date, 'YYYYMMDD') "
+            f">= current_date - interval '{WINDOW_DAYS} days'"
+        )
+
+    cursor.execute(f"""
         INSERT INTO raw.observations
             (station_id, obs_date, element, value,
              m_flag, q_flag, s_flag, obs_time, source_file)
         SELECT station_id, obs_date, element, value,
                m_flag, q_flag, s_flag, obs_time, source_file
         FROM staging
+        {where_clause}
         ON CONFLICT (station_id, obs_date, element)
         DO UPDATE SET
             value       = EXCLUDED.value,
