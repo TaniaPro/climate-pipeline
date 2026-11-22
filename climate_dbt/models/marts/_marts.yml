@@ -1,0 +1,61 @@
+version: 2
+
+models:
+  - name: fct_station_yearly
+    data_tests:
+      - unique:
+          column_name: "station_id || '-' || year"
+    columns:
+      - name: station_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_stations')
+                field: station_id
+      - name: year
+        data_tests:
+          - not_null
+      - name: tmax_avg
+        data_tests:
+          - not_null
+  
+  
+  - name: fct_country_yearly_anomalies
+    data_tests:
+      - unique:
+          column_name: "country_code || '-' || year"
+    columns:
+      - name: country_code
+        data_tests:
+          - not_null
+      - name: year
+        data_tests:
+          - not_null
+      - name: avg_anomaly
+        data_tests:
+          - not_null
+
+  - name: fct_country_trends
+    data_tests:
+      - unique:
+          column_name: "country_code"
+    columns:
+      - name: country_code
+        data_tests:
+          - not_null
+      - name: slope_c_per_decade
+        data_tests:
+          - not_null
+      - name: avg_stations
+        data_tests:
+          - not_null
+      - name: years
+        data_tests:
+          - not_null
+      - name: station_dist_count
+        data_tests:
+          - not_null
+      - name: is_reportable
+        data_tests:
+          - not_null
