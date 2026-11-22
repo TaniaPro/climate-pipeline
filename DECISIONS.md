@@ -1174,6 +1174,55 @@ days since start_date).
      (unbuffered), so "loaded <station>: N rows (i/491)" streams live.
 Observed: ~1 station per second, so a full daily load takes ~9 minutes.
 
+## 2026-11-22
+
+**First full Airflow run: all green (2026-11-14)**
+Manual run after the fixes: load_observations 10 min 13 s (491 stations, ~1 s
+each) -> dbt_run 18 s -> dbt_test 3 s, in order. The DAG was then paused so it
+doesn't run unattended until wanted; unpausing starts one run for the latest
+missed day (catchup=False means only one, not one per missed day).
+
+**start_airflow.sh: Airflow settings live in the repo**
+The DAGS_FOLDER / LOAD_EXAMPLES overrides existed only as `export`s in one
+terminal tab — close it and Airflow forgets the repo's dags/ folder. Options:
+~/.zshrc (every terminal, but outside the repo), ~/airflow/airflow.cfg (outside the
+repo), or a start script in the repo. Chose the script: it's in Git, so anyone who
+clones the repo starts Airflow the same way, and it documents how to run it.
+The script is the same commands as by hand: activate ~/airflow-venv, export the
+two settings, `airflow standalone`.
+Portability: the DAGs path is not hard-coded to this Mac. The script finds its own
+folder with REPO="$(cd "$(dirname "$0")" && pwd)" — $0 is the script's path as
+typed (bash sets it automatically), dirname drops the file name, cd + pwd turn it
+into a full path — and uses $REPO/dags. `chmod +x` marks it runnable (Git stores
+that, mode 100755).
+`airflow standalone` warns it's for development only: it bundles every component
+in one process with a built-in database. Right for a local portfolio; production
+runs the components separately on a real database.
+
+**dbt tests on the dashboard marts (16 tests)**
+dbt_test used to run 0 tests, so it always passed. A dbt test is a rule turned into
+a query that returns the rows BREAKING it: 0 rows = pass. Tests live in
+models/marts/_marts.yml; the model a test belongs to is decided by YAML
+indentation (test under column under model).
+  - not_null on the keys and on every value the dashboard depends on.
+  - unique on the grain. The built-in unique checks one column, so composite grains
+    are tested as one glued value: column_name: "station_id || '-' || year"
+    (fct_station_yearly), "country_code || '-' || year"
+    (fct_country_yearly_anomalies); country_code alone for fct_country_trends.
+  - relationships on fct_station_yearly.station_id -> stg_stations.station_id:
+    every station in the final table must exist in the roster.
+Why relationships and not "row counts match": the marts filter on purpose (the
+completeness rule drops ~30% of station-years), so counts SHOULD differ. A filter
+can only remove rows, never invent them — so the right check is "nothing appears
+that shouldn't" (a subset check), not equality. It would catch leaked stations
+like the October orphans.
+Result: 16 tests, all pass, ~2 s. They run in Airflow after every dbt_run.
+Considered and deferred: an invariant test that the average anomaly over 1991–2020
+is ~0 (true by construction — anomalies are differences from each station's own
+1991–2020 average, so they cancel out; a non-zero result would mean a broken join
+or normals built from different data). Kept out until it can be explained with
+confidence.
+
 ---
 
 ## Open / undecided (current)
@@ -1235,20 +1284,15 @@ Observed: ~1 station per second, so a full daily load takes ~9 minutes.
   Consider adding is_reportable to fct_country_yearly_anomalies and filtering on it.
 - download_countries_meta_data can return None on a failed fetch; parse would
   crash on "for line in lines" (same gap as select_stations above).
-- Airflow settings are only `export`ed in one terminal tab — closing it loses
-  DAGS_FOLDER and LOAD_EXAMPLES. Make them permanent (airflow.cfg or a start
-  script in the repo).
-- dbt_test currently runs 0 tests, so it always passes. Add real tests
-  (not_null / unique on keys, accepted range, anomalies average ~0 over
-  1991–2020, roster/data gaps — see above).
+- More dbt tests (16 exist on the marts since 2026-11-22): staging/source tests,
+  an accepted range for values, the anomaly-baseline ~0 invariant (deferred).
 - Manual "setup_reference" DAG (schedule=None: countries -> stations) so the
   roster build is documented and one click away, never automatic.
 - Airflow runs only while the Mac is awake and `airflow standalone` is open — fine
   for a local portfolio; a hosted/Docker setup is a later option.
-- First full scheduled run (load ~9 min -> dbt run -> dbt test): verify green.
-- NEXT: Airflow loose ends (permanent settings, dbt tests) -> chart 2 (bar chart
-  of slope_c_per_decade) -> chart 3 (data coverage) -> publish to Tableau Public
-  -> README with architecture diagram and dbt lineage graph; then PRCP.
+- NEXT: chart 2 (bar chart of slope_c_per_decade) -> chart 3 (data coverage) ->
+  publish to Tableau Public -> README with architecture diagram and dbt lineage
+  graph. PRCP is an optional extension, not part of "done".
 
 ## Resolved (was open, now done)
 - Full backfill: all 491 loaded — DONE (2026-08-27, 52.5M rows).
@@ -1302,5 +1346,11 @@ Observed: ~1 station per second, so a full daily load takes ~9 minutes.
   0 rows ok) — DONE (2026-11-08).
 - Airflow 3.3.2 installed (own venv); DAG climate_daily in the repo with
   load_observations >> dbt_run >> dbt_test, max_active_runs=1 — DONE (2026-11-14).
+- First full DAG run all green (load 10 min, dbt run 18 s, dbt test 3 s) — DONE
+  (2026-11-14).
+- Airflow settings made permanent via start_airflow.sh in the repo — DONE
+  (2026-11-22).
+- dbt tests on the three dashboard marts (16: not_null, unique grain,
+  relationships to stg_stations) — DONE (2026-11-22).
 - First mart fct_station_yearly built via two intermediate models; 12,012 valid
   station-years (69.4%) — DONE (2026-10-25).
