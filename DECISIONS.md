@@ -1286,6 +1286,81 @@ Airflow orchestrates the pipeline, the agent orchestrates its own tool calls.
 Design constraints to own: which tools it gets, read-only database access, and
 what happens when it's wrong.
 
+## 2026-11-25 (agent design)
+
+**Ops agent v1: what the morning report must say**
+Designed from the output backwards (an agent can only report what its tools can
+read). The report, delivered after every nightly run:
+  1. which Airflow task failed, if any;
+  2. dbt test results — which test failed, on what;
+  3. volume — rows loaded, stations processed, stations that returned 0 rows,
+     download failures — compared with what's normal;
+  4. what to do about it (a report to act on, not just a status).
+Volume is the crucial part: it catches SILENT failures. In daily mode 0 rows is
+not an error, so if NOAA's files stopped updating, every task would stay green
+while hundreds of stations load nothing. Same habit as checking row counts per
+period after a load.
+Delivery: a Telegram bot — instant on the phone, free, no workspace to set up
+(Slack would need one; email was the other option).
+
+**Tools: three read-only, one narrow action**
+  - get_task_states(): Airflow task states of the run (Airflow's API).
+  - get_dbt_test_results(): climate_dbt/target/run_results.json — dbt writes the
+    pass/fail of every test there after each run.
+  - query_manifest(): fixed queries on meta._load_manifest.
+  - send_telegram(message): sends only to my chat.
+Least privilege: an LLM can misread a situation, make mistakes, or be tricked by
+text inside a log or error message. Read tools can at worst produce a wrong
+report; act tools are kept to one, as narrow as possible. Database access through
+a separate Postgres user that can only SELECT, so Postgres itself refuses writes.
+Fixed queries, not free SQL (v1): safer and I know exactly what it can touch;
+costs flexibility and my time, but each query is written once and reused nightly.
+The query library grows human-in-the-loop: when the agent can't answer something
+it says so, I write and review a new query, and add it. v2 (triage) may allow
+free SQL only behind guards (read-only user, time limit, row limit).
+The agent does NOT stop or pause the pipeline: that would be an act tool with
+power over the pipeline. Airflow already stops a failing run's downstream tasks,
+and the next night's load is safe to retry (idempotent). Any "pause after
+failure" would be a deterministic Airflow rule, not an LLM's judgment — the agent
+informs, I decide.
+
+**ops_agent runs even when the pipeline fails: trigger_rule="all_done"**
+DAG: load_observations >> dbt_run >> dbt_test >> ops_agent. Airflow's default
+runs a task only if everything upstream succeeded — so on a failed night the agent
+would be skipped (upstream_failed) and send nothing, exactly when the report
+matters most. all_done = run once the upstream tasks finish, however they ended.
+
+**LLM: Claude Agent SDK**
+Needs an LLM API with tool use (the model decides which function to call). The
+Claude Agent SDK runs the decide -> call tool -> read result -> repeat loop; tools
+are plain Python functions. It can run on a Claude plan (drawing on the plan's
+usage limits) or with an API key — rules changed several times in 2026, so the
+code keeps the auth switch a one-line config change. Purchased API credits expire
+one year after purchase and are non-refundable; an existing key from ~2 months
+ago will be checked when it's time to run.
+
+**Fixed query 1: last run's volume**
+"Last run" = manifest rows with updated_at >= date(max(updated_at)): the nightly
+run starts 00:00 UTC and takes ~10 minutes, so it sits on one UTC date (a manual
+run started just before midnight would split — accepted). One row, no GROUP BY
+(every column is an aggregate):
+  last run date, stations_updated (count), total_rows (SUM row_count),
+  zero_row_stations (count FILTER row_count = 0),
+  failed_stations (count FILTER status = 'failed').
+stations_updated catches a run that crashed halfway (e.g. 250 of 491 dated that
+day). Named zero_row_stations, not "not updated" — those stations were processed,
+they just had no new days; the agent reads column names to interpret numbers.
+2026-11-14 run: 491 stations, 91,617 rows, 92 zero-row stations (~19%, stations
+whose records stopped), 0 failed.
+
+**"Normal" needs history: meta._run_history (planned)**
+_load_manifest keeps only the LATEST run (each night overwrites it), so the agent
+can't tell whether 92 zero-row stations is normal. Plan: a table with one row per
+run (the query above, appended nightly); after a few weeks "normal" is measurable.
+Who writes it — the pipeline or the agent — is open (see Open).
+Tooling: DBeaver (community) connected to the local climate DB for ad-hoc queries
+(localhost:5432, my OS user, no password).
+
 ---
 
 ## Open / undecided (current)
@@ -1357,9 +1432,13 @@ what happens when it's wrong.
   optional.
 - Tableau Public renders the chart titles in a substitute serif font (the desktop
   font isn't web-available); set titles to a web-safe font if it matters.
-- NEXT: ops agent (v1 daily report, v2 failure triage) as the last DAG task ->
-  README with architecture diagram and dbt lineage graph. PRCP is an optional
-  extension, not part of "done".
+- meta._run_history: who writes the nightly row — the pipeline or the agent?
+  (Read-only rule for the agent points to the pipeline.)
+- Agent setup still to do: read-only Postgres user; Telegram bot + chat id;
+  access to Airflow task states (API auth); check the existing API key/credits.
+- NEXT: ops agent v1 — run history -> the 4 tools -> agent loop -> DAG task
+  (trigger_rule="all_done") -> Telegram; then README with architecture diagram
+  and dbt lineage graph. PRCP is an optional extension, not part of "done".
 
 ## Resolved (was open, now done)
 - Full backfill: all 491 loaded — DONE (2026-08-27, 52.5M rows).
