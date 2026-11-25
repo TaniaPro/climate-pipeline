@@ -1223,6 +1223,69 @@ is ~0 (true by construction — anomalies are differences from each station's ow
 or normals built from different data). Kept out until it can be explained with
 confidence.
 
+## 2026-11-24 / 2026-11-25
+
+**Chart 2: warming per decade, by country (bar chart)**
+One bar per country (country_name), length = slope_c_per_decade, straight from
+fct_country_trends — Tableau only displays it.
+  - Color by is_reportable: CA and JA in grey, the rest in one accent color.
+  - Sorted fastest to slowest; value labels on the bars (2 decimals).
+  - Axis renamed "Warming (°C per decade)" — viewers don't know "slope".
+  - Title kept neutral: "Warming per decade, by country (1990–2025)". A title
+    naming countries ("Germany fastest...") was rejected — a data refresh could
+    change the ranking and silently make the title wrong.
+  - Separate Tableau data source (country_trends.csv). Dropping a second CSV into
+    an existing data source would JOIN the two tables and break chart 1.
+Plausibility check: the European slopes (FR 0.51, SP 0.47, GM 0.56 °C/decade)
+match WMO/Copernicus's ~+0.5 °C per decade for Europe over 1991–2021. US 0.16 is
+the least certain reportable number (24 stations; daily highs, not means).
+
+**Chart 3: data coverage — stations selected vs usable**
+Shows WHY Canada and Japan are grey: per country, stations in the roster vs
+stations with a valid 1991–2020 normal, with a dashed reference line at the
+10-station cutoff.
+  - Needed a new metric: roster_station_count. Added in dbt, not Tableau
+    (metrics live in dbt): a second CTE in fct_country_trends counting
+    stg_stations per country, joined on country_code. Roster: 75 each except
+    CA 48 and FR 68 (NOAA didn't have 75 qualifying stations there) = 491.
+  - Both measures on one shared axis (Measure Values), colored by Measure Names.
+    Colors chosen so meaning carries across charts: Selected = light grey
+    (background), Usable = the accent color (the data that counts).
+  - Tableau re-reads a CSV's columns only when the table is re-added: after a new
+    column was inserted mid-file, Refresh failed ("unknown column") until the
+    table was removed and dragged back.
+
+**Dashboard: one page, published to Tableau Public**
+Layout as a short story: headline numbers on top (warming per decade), then the
+evidence (anomalies over time) and the honesty footnote (coverage) side by side.
+Title "Warming Trends: 1990–2025"; footer credits the source and the pipeline
+(NOAA GHCN-Daily · Python → Postgres → dbt → Airflow · GitHub link), so a
+viewer can find the pipeline behind the graph.
+  - Size set to FIXED: with Automatic, the browser resized the page — bars got
+    squashed, labels vanished and "United States" was cut off.
+  - Published as "Warming Trends 1990–2025", with a short description and the
+    GitHub repo as the external link. Republishing under the same name overwrites
+    it and keeps the URL.
+Design: a fuller redesign (dark theme, headline numbers, "warming stripes") was
+considered and deferred — for a Data Engineer portfolio the dashboard's job is to
+prove the pipeline produces correct, honest output; the pipeline, tests and
+orchestration carry more weight. The workbook stays in the repo, so a redesign
+can be republished to the same link later.
+
+**Next major piece: a pipeline "ops agent" (planned, not built)**
+An LLM agent as the last task of the Airflow DAG:
+  load_observations >> dbt_run >> dbt_test >> ops_agent
+  - v1, daily report: tools to query Postgres (row counts, 0-row stations), read
+    dbt's test results and the Airflow log; it decides which to call and writes a
+    short report of what happened and what looks unusual.
+  - v2, failure triage: when a task fails, investigate the error and the failing
+    rows and explain the likely cause.
+Chosen over "ask the data" (text-to-SQL): it solves a real pipeline problem
+(someone has to read logs every morning) and shows orchestration on two levels —
+Airflow orchestrates the pipeline, the agent orchestrates its own tool calls.
+Design constraints to own: which tools it gets, read-only database access, and
+what happens when it's wrong.
+
 ---
 
 ## Open / undecided (current)
@@ -1290,9 +1353,13 @@ confidence.
   roster build is documented and one click away, never automatic.
 - Airflow runs only while the Mac is awake and `airflow standalone` is open — fine
   for a local portfolio; a hosted/Docker setup is a later option.
-- NEXT: chart 2 (bar chart of slope_c_per_decade) -> chart 3 (data coverage) ->
-  publish to Tableau Public -> README with architecture diagram and dbt lineage
-  graph. PRCP is an optional extension, not part of "done".
+- Dashboard redesign (dark theme, headline numbers, warming stripes) — deferred,
+  optional.
+- Tableau Public renders the chart titles in a substitute serif font (the desktop
+  font isn't web-available); set titles to a web-safe font if it matters.
+- NEXT: ops agent (v1 daily report, v2 failure triage) as the last DAG task ->
+  README with architecture diagram and dbt lineage graph. PRCP is an optional
+  extension, not part of "done".
 
 ## Resolved (was open, now done)
 - Full backfill: all 491 loaded — DONE (2026-08-27, 52.5M rows).
@@ -1352,5 +1419,9 @@ confidence.
   (2026-11-22).
 - dbt tests on the three dashboard marts (16: not_null, unique grain,
   relationships to stg_stations) — DONE (2026-11-22).
+- Charts 2 (warming per decade) and 3 (data coverage); roster_station_count in
+  fct_country_trends — DONE (2026-11-24).
+- Dashboard published to Tableau Public as "Warming Trends 1990–2025" (fixed size,
+  description, GitHub link) — DONE (2026-11-25).
 - First mart fct_station_yearly built via two intermediate models; 12,012 valid
   station-years (69.4%) — DONE (2026-10-25).
