@@ -31,4 +31,16 @@ with DAG(
         bash_command=f"cd {PROJECT}/climate_dbt && ../.venv/bin/dbt test",
     )
 
-    load_observations >> dbt_run >> dbt_test
+    record_run_history = BashOperator(
+        task_id="record_run_history",
+        bash_command=f"cd {PROJECT} && psql climate -v ON_ERROR_STOP=1 -f sql/record_run_history.sql",
+        trigger_rule="all_done",
+    )
+
+    #                     ┌──> dbt_run ──> dbt_test
+    # load_observations ──┤
+    #                     └──> record_run_history
+
+    load_observations >> [dbt_run, record_run_history]
+    dbt_run >> dbt_test
+
